@@ -1,0 +1,16 @@
+{
+  "name": "premium-telegram-bot",
+  "version": "1.0.0",
+  "description": "Telegram Premium Bot with MongoDB",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.7.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "author": "Admin",
+  "license": "ISC"
+}
