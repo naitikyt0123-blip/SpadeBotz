@@ -1,4 +1,3 @@
-require('./backup.js');
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 
