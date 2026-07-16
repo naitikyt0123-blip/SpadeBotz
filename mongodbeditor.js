@@ -8,7 +8,7 @@ const BOT_TOKEN = "8895076785:AAGLd626qzY1GhRj4qwbogwPih730bM8ee8";
 const ADMIN_CHAT_ID = 5291409360;
 
 // Railway me MONGO_URI env variable se aayega
-if (!process.env.MONGO_URI) {
+if (!process.env.MONGO_URL) {
     console.error("ERROR: MONGO_URI environment variable set nahi hai. Kripya Railway me ise add karein.");
     process.exit(1);
 }
