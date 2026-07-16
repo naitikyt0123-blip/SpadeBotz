@@ -3,20 +3,28 @@ const { MongoClient } = require('mongodb');
 const fs = require('fs');
 const fsp = fs.promises;
 const os = require('os');
+const path = require('path');
 
 const BOT_TOKEN = "8895076785:AAGLd626qzY1GhRj4qwbogwPih730bM8ee8";
 const ADMIN_CHAT_ID = 5291409360;
 
-// Railway me MONGO_URI env variable se aayega
+// Checks for MONGO_URL since that is what you have set in your environment
 if (!process.env.MONGO_URL) {
-    console.error("ERROR: MONGO_URI environment variable set nahi hai. Kripya Railway me ise add karein.");
+    console.error("ERROR: MONGO_URL environment variable is not set. Please add it to your environment.");
     process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Configured with specific polling parameters to prevent memory/conflict drops in multi-bot setups
+const bot = new TelegramBot(BOT_TOKEN, { 
+    polling: {
+        interval: 300,
+        autoStart: true,
+        params: { timeout: 10 }
+    } 
+});
+
 let mongoClient = null;
 
-// Admin ka state track karne ke liye in-memory storage
 const adminState = {
     tempFilePath: null,
     selectedDb: null,
@@ -25,25 +33,25 @@ const adminState = {
     colList: []
 };
 
-// MongoDB Connection helper function
 async function getMongoClient() {
     if (!mongoClient) {
-        console.log("MongoDB se connect kar rahe hain...");
-        mongoClient = new MongoClient(process.env.MONGO_URI);
+        console.log("Connecting to MongoDB...");
+        mongoClient = new MongoClient(process.env.MONGO_URL);
         await mongoClient.connect();
-        console.log("✅ MongoDB successfully connect ho gaya!");
+        console.log("✅ MongoDB connected successfully!");
     }
     return mongoClient;
 }
 
-// Temp file cleanup function memory leak rokne ke liye
 async function cleanupState() {
     if (adminState.tempFilePath) {
         try {
-            await fsp.unlink(adminState.tempFilePath);
-            console.log(`🗑️ Temp file delete ho gayi: ${adminState.tempFilePath}`);
+            if (fs.existsSync(adminState.tempFilePath)) {
+                await fsp.unlink(adminState.tempFilePath);
+                console.log(`🗑️ Temp file deleted: ${adminState.tempFilePath}`);
+            }
         } catch (error) {
-            console.error("Temp file delete karne me error aaya:", error.message);
+            console.error("Error deleting temp file:", error.message);
         }
         adminState.tempFilePath = null;
     }
@@ -53,69 +61,66 @@ async function cleanupState() {
     adminState.colList = [];
 }
 
-// Access Control check
 function checkAdmin(chatId) {
     return chatId === ADMIN_CHAT_ID;
 }
 
-// Global Message Handler - Unauthorized users ko block karne ke liye
 bot.on('message', (msg) => {
+    if (!msg.text || msg.text.startsWith('/start')) return;
     if (!checkAdmin(msg.chat.id)) {
         bot.sendMessage(msg.chat.id, "Access Denied").catch(() => {});
     }
 });
 
-// Command: /start
 bot.onText(/\/start/, async (msg) => {
     if (!checkAdmin(msg.chat.id)) return;
     
-    console.log("Admin ne /start command bheji.");
-    await cleanupState(); // Purani koi state ho toh usko reset karein
+    console.log("Admin sent /start command.");
+    await cleanupState(); 
     await bot.sendMessage(ADMIN_CHAT_ID, "📂 Send me a .json file to replace MongoDB data.");
 });
 
-// Document Handler (JSON Uploads)
 bot.on('document', async (msg) => {
     if (!checkAdmin(msg.chat.id)) return;
 
     const doc = msg.document;
     
-    // Check karein ki file strictly .json hi hai
     if (!doc.file_name || !doc.file_name.toLowerCase().endsWith('.json')) {
-        console.log("Reject kiya: File .json format me nahi thi.");
-        return bot.sendMessage(ADMIN_CHAT_ID, "❌ Format galat hai. Kripya sirf .json document upload karein.");
+        console.log("Rejected: File format is not .json");
+        return bot.sendMessage(ADMIN_CHAT_ID, "❌ Invalid format. Please upload a .json document only.");
     }
 
     try {
-        await cleanupState(); // Nayi file aane par purani remove karein
-        const waitMsg = await bot.sendMessage(ADMIN_CHAT_ID, "📥 File download ho rahi hai...");
+        await cleanupState();
+        const waitMsg = await bot.sendMessage(ADMIN_CHAT_ID, "📥 Downloading file...");
         
-        // File download process
+        // Use os temp directory for storage
         const filePath = await bot.downloadFile(doc.file_id, os.tmpdir());
         adminState.tempFilePath = filePath;
-        console.log(`✅ File successfully download hui temporary path par: ${filePath}`);
+        console.log(`✅ File downloaded successfully to: ${filePath}`);
 
         bot.deleteMessage(ADMIN_CHAT_ID, waitMsg.message_id).catch(() => {});
         await showDatabases(ADMIN_CHAT_ID);
         
     } catch (error) {
-        console.error("Telegram file download error:", error);
-        bot.sendMessage(ADMIN_CHAT_ID, "❌ Telegram se download karne me error: " + error.message);
+        console.error("Telegram download error:", error);
+        bot.sendMessage(ADMIN_CHAT_ID, "❌ Error downloading from Telegram: " + error.message);
     }
 });
 
-// Databases fetch and display function
 async function showDatabases(chatId) {
     try {
         const client = await getMongoClient();
         const adminDb = client.db().admin();
         const result = await adminDb.listDatabases();
         
-        // Filter out local aur admin dbs if you want, par abhi sab show karenge
-        adminState.dbList = result.databases.map(db => db.name);
+        adminState.dbList = result.databases ? result.databases.map(db => db.name) : [];
+
+        if (adminState.dbList.length === 0) {
+            return bot.sendMessage(chatId, "❌ No databases found.");
+        }
 
         const keyboard = [];
-        // Callback limit bypass karne ke liye index based routing use ki hai
         for (let i = 0; i < adminState.dbList.length; i += 2) {
             const row = [];
             row.push({ text: adminState.dbList[i], callback_data: `db_${i}` });
@@ -125,27 +130,25 @@ async function showDatabases(chatId) {
             keyboard.push(row);
         }
 
-        await bot.sendMessage(chatId, "🗄 Database select karein:", {
+        await bot.sendMessage(chatId, "🗄 Select a Database:", {
             reply_markup: { inline_keyboard: keyboard }
         });
-        console.log("Databases ki list admin ko bhej di gayi.");
     } catch (error) {
         console.error("DB Fetch Error:", error);
-        bot.sendMessage(chatId, "❌ Database fetch fail ho gaya: " + error.message);
+        bot.sendMessage(chatId, "❌ Database fetch failed: " + error.message);
         await cleanupState();
     }
 }
 
-// Collections fetch and display function
 async function showCollections(messageId, dbName) {
     try {
         const client = await getMongoClient();
         const db = client.db(dbName);
         const collections = await db.listCollections().toArray();
-        adminState.colList = collections.map(c => c.name);
+        adminState.colList = collections ? collections.map(c => c.name) : [];
 
         if (adminState.colList.length === 0) {
-            await bot.editMessageText(`🗄 Database: ${dbName}\n❌ Isme koi collection nahi mili.`, {
+            await bot.editMessageText(`🗄 Database: ${dbName}\n❌ No collections found inside this database.`, {
                 chat_id: ADMIN_CHAT_ID,
                 message_id: messageId
             });
@@ -163,20 +166,18 @@ async function showCollections(messageId, dbName) {
             keyboard.push(row);
         }
 
-        await bot.editMessageText(`🗄 Database: ${dbName}\n📑 Ab Collection select karein:`, {
+        await bot.editMessageText(`🗄 Database: ${dbName}\n📑 Now select a Collection:`, {
             chat_id: ADMIN_CHAT_ID,
             message_id: messageId,
             reply_markup: { inline_keyboard: keyboard }
         });
-        console.log(`${dbName} ki collections admin ko bhej di gayi.`);
     } catch (error) {
         console.error("Collection fetch error:", error);
-        bot.sendMessage(ADMIN_CHAT_ID, "❌ Collections fetch fail ho gaya: " + error.message);
+        bot.sendMessage(ADMIN_CHAT_ID, "❌ Collections fetch failed: " + error.message);
         await cleanupState();
     }
 }
 
-// Replacement confirmation logic
 async function sendConfirmation(messageId) {
     const text = `⚠️ Database: ${adminState.selectedDb}\n⚠️ Collection: ${adminState.selectedCollection}\n\nThis operation will permanently delete every document.`;
     const keyboard = [
@@ -191,17 +192,16 @@ async function sendConfirmation(messageId) {
     });
 }
 
-// Final execution function
 async function executeReplacement(messageId) {
-    if (!adminState.tempFilePath) {
-        return bot.editMessageText("❌ Error: JSON file memory se gayab ho gayi hai. Kripya wapas upload karein.", {
+    if (!adminState.tempFilePath || !fs.existsSync(adminState.tempFilePath)) {
+        return bot.editMessageText("❌ Error: JSON file is missing from memory. Please upload it again.", {
             chat_id: ADMIN_CHAT_ID,
             message_id: messageId
         });
     }
 
     const startTime = Date.now();
-    await bot.editMessageText("⏳ Data replace ho raha hai, kripya wait karein...", { 
+    await bot.editMessageText("⏳ Replacing data, please wait...", { 
         chat_id: ADMIN_CHAT_ID, 
         message_id: messageId 
     });
@@ -213,22 +213,19 @@ async function executeReplacement(messageId) {
         try {
             jsonData = JSON.parse(fileData);
         } catch (err) {
-            throw new Error("Invalid JSON File. Kripya apna syntax check karein.");
+            throw new Error("Invalid JSON File. Please check the syntax.");
         }
 
         if (!jsonData || (Array.isArray(jsonData) && jsonData.length === 0) || (Object.keys(jsonData).length === 0)) {
-            throw new Error("Aapne empty JSON file di hai.");
+            throw new Error("The provided JSON file is empty.");
         }
 
         const client = await getMongoClient();
         const collection = client.db(adminState.selectedDb).collection(adminState.selectedCollection);
 
-        // Saare purane documents delete ho rahe hain
         const deleteResult = await collection.deleteMany({});
         const deletedCount = deleteResult.deletedCount;
-        console.log(`Purane ${deletedCount} documents delete ho gaye.`);
-
-        // Naye documents insert ho rahe hain (Array ya single Object detect karke)
+        
         let insertedCount = 0;
         if (Array.isArray(jsonData)) {
             const insertResult = await collection.insertMany(jsonData);
@@ -237,7 +234,7 @@ async function executeReplacement(messageId) {
             await collection.insertOne(jsonData);
             insertedCount = 1;
         } else {
-            throw new Error("Aapki JSON file Object ya Array format me honi chahiye.");
+            throw new Error("The JSON file must contain a valid Object or Array.");
         }
 
         const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -249,11 +246,11 @@ async function executeReplacement(messageId) {
             message_id: messageId
         });
         
-        console.log("✅ Data successfully replace ho gaya!");
+        console.log("✅ Data replaced successfully!");
 
     } catch (error) {
-        console.error("Replacement Execution Error:", error);
-        await bot.editMessageText(`❌ Replacement ke time error aaya:\n\n${error.message}`, {
+        console.error("Replacement Error:", error);
+        await bot.editMessageText(`❌ Replacement error:\n\n${error.message}`, {
             chat_id: ADMIN_CHAT_ID,
             message_id: messageId
         });
@@ -262,8 +259,10 @@ async function executeReplacement(messageId) {
     }
 }
 
-// Callback Query Handler (Buttons click handle karne ke liye)
 bot.on('callback_query', async (query) => {
+    // Safety check added here to prevent the undefined crash
+    if (!query || !query.data) return;
+
     const data = query.data;
     const messageId = query.message.message_id;
 
@@ -276,30 +275,30 @@ bot.on('callback_query', async (query) => {
             const index = parseInt(data.replace('db_', ''));
             adminState.selectedDb = adminState.dbList[index];
             await showCollections(messageId, adminState.selectedDb);
-            bot.answerCallbackQuery(query.id);
+            bot.answerCallbackQuery(query.id).catch(() => {});
             
         } else if (data.startsWith('col_')) {
             const index = parseInt(data.replace('col_', ''));
             adminState.selectedCollection = adminState.colList[index];
             await sendConfirmation(messageId);
-            bot.answerCallbackQuery(query.id);
+            bot.answerCallbackQuery(query.id).catch(() => {});
             
         } else if (data === 'confirm_yes') {
-            bot.answerCallbackQuery(query.id);
+            bot.answerCallbackQuery(query.id).catch(() => {});
             await executeReplacement(messageId);
             
         } else if (data === 'confirm_no') {
-            bot.answerCallbackQuery(query.id);
-            await bot.editMessageText("❌ Replacement cancel kar diya gaya hai.", {
+            bot.answerCallbackQuery(query.id).catch(() => {});
+            await bot.editMessageText("❌ Replacement cancelled.", {
                 chat_id: ADMIN_CHAT_ID,
                 message_id: messageId
             });
             await cleanupState();
         }
     } catch (error) {
-        console.error("Callback query catch block error:", error);
-        bot.sendMessage(ADMIN_CHAT_ID, "❌ System error: " + error.message);
+        console.error("Callback query error:", error);
+        bot.sendMessage(ADMIN_CHAT_ID, "❌ System error: " + error.message).catch(() => {});
     }
 });
 
-console.log("🤖 MongoDB Editor Bot strictly shuru ho gaya hai. Waiting for commands...");
+console.log("🤖 MongoDB Editor Bot is online and waiting for commands...");
