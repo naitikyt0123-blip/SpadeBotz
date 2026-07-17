@@ -1,0 +1,36 @@
+[phases.setup]
+nixPkgs = [
+  "nodejs_20",
+  "chromium",
+  "glib",
+  "nss",
+  "nspr",
+  "atk",
+  "at-spi2-atk",
+  "at-spi2-core",
+  "cups",
+  "dbus",
+  "libdrm",
+  "gtk3",
+  "pango",
+  "cairo",
+  "libxkbcommon",
+  "mesa",
+  "expat",
+  "alsa-lib",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxcb",
+  "xorg.libXScrnSaver",
+  "xorg.libXtst"
+]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "node start.js"
