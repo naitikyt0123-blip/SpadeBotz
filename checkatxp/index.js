@@ -4,7 +4,7 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 
 // ================== CONFIG (Yaha apna daalo) ==================
-const BOT_TOKEN = process.env.ATXP_BOT_TOKEN || "8507909071:AAH-dKGOKGP1-UKfnrHB7pB378BcjZWvLuQ";
+const BOT_TOKEN = process.env.ATXP_BOT_TOKEN || "8507909071:AAH3zwug9y7s8vIqxuF-QI8GHwab5o6FnRU";
 let CHAT_ID = process.env.ATXP_CHAT_ID || "5291409360";
 const EMAIL = process.env.ATXP_EMAIL || "flwdlqx@indogmail.com";
 const URL = "https://accounts.atxp.ai/fund";
