@@ -13,3 +13,4 @@ function run(file) {
 run("rajpom/index.js");
 run("titanpom/index.js");
 run("mongodbeditor.js");
+run("checkatxp/index.js");
