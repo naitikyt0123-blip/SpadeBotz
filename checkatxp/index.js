@@ -1,5 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const { chromium } = require("playwright");
+const { execSync } = require("child_process");
 
 // ================== CONFIG (Yaha apna daalo) ==================
 const BOT_TOKEN = process.env.ATXP_BOT_TOKEN || "8507909071:AAH-dKGOKGP1-UKfnrHB7pB378BcjZWvLuQ";
@@ -27,7 +28,7 @@ async function sendMsg(text) {
   }
 }
 
-// ============ HELPER: error ko detail me bhejo ============
+// ============ HELPER: error detail me bhejo ============
 async function sendError(step, e) {
   let msg = "❌ ERROR at STEP: " + step + "\n";
   msg += "Reason: " + (e && e.message ? e.message : e);
@@ -45,6 +46,18 @@ async function sendShot(page, caption) {
     console.error("[atxp] Screenshot error:", e.message);
     await sendMsg("⚠️ Screenshot nahi le paya: " + e.message);
   }
+}
+
+// ============ HELPER: chromium path dhundo ============
+function findChromium() {
+  const candidates = ["chromium", "chromium-browser", "chrome", "google-chrome"];
+  for (const c of candidates) {
+    try {
+      const p = execSync("which " + c, { encoding: "utf8" }).trim();
+      if (p) return p;
+    } catch (e) {}
+  }
+  return undefined;
 }
 
 // ============ HELPER: code ka wait ============
@@ -66,6 +79,15 @@ function waitForCode(timeoutMs = 300000) {
   });
 }
 
+// ============ HELPER: browser safe close ============
+async function safeClose(browser) {
+  try {
+    if (browser) await browser.close();
+  } catch (e) {
+    console.error("[atxp] Close error:", e.message);
+  }
+}
+
 // ==================== MAIN AUTOMATION ====================
 async function runAutomation() {
   if (automationRunning) {
@@ -78,10 +100,18 @@ async function runAutomation() {
   let browser;
   let page;
 
-  // -------- BROWSER LAUNCH --------
+  // -------- STEP 1: BROWSER LAUNCH --------
   try {
     await sendMsg("⏳ [1/8] Browser launch kar raha hoon...");
-    browser = await chromium.launch({
+
+    let execPath = findChromium();
+    if (execPath) {
+      await sendMsg("🔎 Chromium mila: " + execPath);
+    } else {
+      await sendMsg("⚠️ System chromium nahi mila, Playwright default try kar raha hoon");
+    }
+
+    const launchOptions = {
       headless: true,
       args: [
         "--no-sandbox",
@@ -90,13 +120,16 @@ async function runAutomation() {
         "--disable-gpu",
         "--single-process",
       ],
-    });
+    };
+    if (execPath) launchOptions.executablePath = execPath;
+
+    browser = await chromium.launch(launchOptions);
     page = await browser.newPage();
     await page.setViewportSize({ width: 412, height: 915 });
     await sendMsg("✓ [1/8] Browser launch ho gaya");
   } catch (e) {
     await sendError("1-BROWSER_LAUNCH", e);
-    await sendMsg("💡 Fix: Railway me variable daalo → PLAYWRIGHT_BROWSERS_PATH = 0");
+    await sendMsg("💡 Fix: nixpacks.toml me chromium + glib libraries add karo");
     automationRunning = false;
     return;
   }
@@ -150,19 +183,14 @@ async function runAutomation() {
   // -------- STEP 5: SUBMIT --------
   try {
     await sendMsg("⏳ [5/8] Submit kar raha hoon...");
-    let submitDone = false;
     try {
       await page.click("text=Submit", { timeout: 15000 });
-      submitDone = true;
       await sendMsg("✓ [5/8] Submit button click ho gaya");
     } catch (e1) {
-      // Backup: Enter key
       await page.keyboard.press("Enter");
-      submitDone = true;
       await sendMsg("✓ [5/8] Submit (Enter key se) ho gaya");
     }
     await page.waitForTimeout(5000);
-    if (!submitDone) throw new Error("Submit ka koi tarika kaam nahi kiya");
   } catch (e) {
     await sendError("5-SUBMIT", e);
     await sendShot(page, "STEP 5 fail - submit nahi hua");
@@ -171,7 +199,7 @@ async function runAutomation() {
     return;
   }
 
-  // -------- STEP 6: CODE POPUP + CODE MAANGO --------
+  // -------- STEP 6: CODE POPUP + MAANGO --------
   let code;
   try {
     await sendMsg("⏳ [6/8] Code popup check kar raha hoon...");
@@ -264,15 +292,6 @@ async function runAutomation() {
   automationRunning = false;
 }
 
-// ============ HELPER: browser safe close ============
-async function safeClose(browser) {
-  try {
-    if (browser) await browser.close();
-  } catch (e) {
-    console.error("[atxp] Close error:", e.message);
-  }
-}
-
 // ==================== TELEGRAM HANDLERS ====================
 
 // /start command
@@ -295,12 +314,9 @@ bot.on("message", async (msg) => {
 });
 
 // ==================== ERROR HANDLING (crash-proof) ====================
-
-// Polling error - 409 conflict pe band mat karo
 bot.on("polling_error", (err) => {
   const m = err && err.message ? err.message : String(err);
   console.error("[atxp] Polling error:", m);
-  // 409 = do instance chal rahe hain, ignore karke chalte raho
 });
 
 process.on("uncaughtException", async (err) => {
