@@ -1,6 +1,7 @@
 const TelegramBot = require("node-telegram-bot-api");
 const { chromium } = require("playwright");
 const { execSync } = require("child_process");
+const fs = require("fs");
 
 // ================== CONFIG (Yaha apna daalo) ==================
 const BOT_TOKEN = process.env.ATXP_BOT_TOKEN || "8507909071:AAH-dKGOKGP1-UKfnrHB7pB378BcjZWvLuQ";
@@ -50,13 +51,41 @@ async function sendShot(page, caption) {
 
 // ============ HELPER: chromium path dhundo ============
 function findChromium() {
-  const candidates = ["chromium", "chromium-browser", "chrome", "google-chrome"];
+  // 1. Env variable se (start.js set karta hai)
+  if (process.env.CHROMIUM_PATH && fs.existsSync(process.env.CHROMIUM_PATH)) {
+    return process.env.CHROMIUM_PATH;
+  }
+
+  // 2. which command se
+  const candidates = ["chromium", "chromium-browser", "chrome", "google-chrome-stable", "google-chrome"];
   for (const c of candidates) {
     try {
-      const p = execSync("which " + c, { encoding: "utf8" }).trim();
-      if (p) return p;
+      const p = execSync("which " + c + " 2>/dev/null", { encoding: "utf8" }).trim();
+      if (p && fs.existsSync(p)) return p;
     } catch (e) {}
   }
+
+  // 3. Nix store me dhundo (Railway/Nixpacks)
+  try {
+    const p = execSync(
+      "find /nix/store -name chromium -type f 2>/dev/null | head -n 1",
+      { encoding: "utf8" }
+    ).trim();
+    if (p && fs.existsSync(p)) return p;
+  } catch (e) {}
+
+  // 4. Common paths
+  const common = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+  ];
+  for (const p of common) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {}
+  }
+
   return undefined;
 }
 
@@ -108,7 +137,7 @@ async function runAutomation() {
     if (execPath) {
       await sendMsg("🔎 Chromium mila: " + execPath);
     } else {
-      await sendMsg("⚠️ System chromium nahi mila, Playwright default try kar raha hoon");
+      await sendMsg("⚠️ Chromium path nahi mila! Ab bina path launch try...");
     }
 
     const launchOptions = {
@@ -129,7 +158,6 @@ async function runAutomation() {
     await sendMsg("✓ [1/8] Browser launch ho gaya");
   } catch (e) {
     await sendError("1-BROWSER_LAUNCH", e);
-    await sendMsg("💡 Fix: nixpacks.toml me chromium + glib libraries add karo");
     automationRunning = false;
     return;
   }
