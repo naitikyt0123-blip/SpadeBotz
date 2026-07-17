@@ -32,5 +32,8 @@ nixPkgs = [
 [phases.install]
 cmds = ["npm install"]
 
+[phases.build]
+cmds = ["echo \"CHROMIUM_PATH=$(which chromium)\" >> /app/.chromium_env"]
+
 [start]
 cmd = "node start.js"
