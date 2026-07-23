@@ -28,4 +28,5 @@ function run(file) {
 
 run("rajpom/index.js");
 run("titanpom/index.js");
+run("kanhaiyapom/index.js")
 run("mongodbeditor.js");
