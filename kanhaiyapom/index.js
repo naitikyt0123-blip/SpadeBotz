@@ -5,7 +5,7 @@ const https = require('https');
 const http = require('http');
 
 // ─── CONFIG ───────────────────────────────────────────────
-const BOT_TOKEN = '8945874588:AAHmQbDffL1Dq9X11adAhYWqWl1HXp6mhio';
+const BOT_TOKEN = '8945874588:AAGeIHwab9cmZ2jRR8M7zeGGlF06WJmdAKw';
 const ADMIN_ID = '7816214323';
 const MONGO_URL = process.env.MONGO_URL;
 
