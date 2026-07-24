@@ -1,67 +1,68 @@
 const TelegramBot = require('node-telegram-bot-api');
 const mongoose = require('mongoose');
 const QRCode = require('qrcode');
+const axios = require('axios');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const BOT_TOKEN = process.env.BOT_TOKEN || '8945874588:AAGeIHwab9cmZ2jRR8M7zeGGlF06WJmdAKw';
-const ADMIN_ID  = process.env.ADMIN_ID  || '7816214323';
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID  = process.env.ADMIN_ID;
 const MONGO_URL = process.env.MONGO_URL;
 
 // ─── STARTUP CHECKS ───────────────────────────────────────────────────────────
-if (!BOT_TOKEN || BOT_TOKEN === 'YOUR_BOT_TOKEN') {
-  console.error('❌ FATAL: BOT_TOKEN not set in environment variables!');
-  process.exit(1);
-}
-if (!ADMIN_ID || ADMIN_ID === 'YOUR_ADMIN_CHAT_ID') {
-  console.error('❌ FATAL: ADMIN_ID not set in environment variables!');
-  process.exit(1);
-}
-if (!MONGO_URL) {
-  console.error('❌ FATAL: MONGO_URL not set in environment variables!');
-  process.exit(1);
-}
+if (!BOT_TOKEN) { console.error('❌ FATAL: BOT_TOKEN missing'); process.exit(1); }
+if (!ADMIN_ID)  { console.error('❌ FATAL: ADMIN_ID missing');  process.exit(1); }
+if (!MONGO_URL) { console.error('❌ FATAL: MONGO_URL missing'); process.exit(1); }
 
-console.log('🚀 Starting Premium Bot...');
-console.log(`📋 Admin ID: ${ADMIN_ID}`);
-console.log(`🔗 MongoDB: ${MONGO_URL.substring(0, 30)}...`);
+// ─── KILL ANY EXISTING WEBHOOK/POLLING ───────────────────────────────────────
+async function killExistingConnections() {
+  try {
+    // Delete webhook and drop pending updates
+    const res = await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`,
+      { drop_pending_updates: true },
+      { timeout: 10000 }
+    );
+    console.log('✅ Webhook cleared:', res.data.description);
+    
+    // Close any existing getUpdates by calling it once with -1 offset
+    await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates`,
+      { offset: -1, limit: 1, timeout: 0 },
+      { timeout: 10000 }
+    );
+    console.log('✅ Existing getUpdates cleared');
+    
+    // Wait for Telegram servers to release the lock
+    await new Promise(r => setTimeout(r, 3000));
+  } catch (err) {
+    console.error('⚠️ killExistingConnections error:', err.message);
+  }
+}
 
 // ─── MONGO CONNECT ────────────────────────────────────────────────────────────
 async function connectMongo() {
-  let retries = 5;
-  while (retries > 0) {
+  for (let i = 5; i > 0; i--) {
     try {
       await mongoose.connect(MONGO_URL, {
         serverSelectionTimeoutMS: 10000,
         socketTimeoutMS: 45000,
       });
-      console.log('✅ MongoDB Connected Successfully');
+      console.log('✅ MongoDB Connected');
       return;
     } catch (err) {
-      retries--;
-      console.error(`❌ MongoDB Connection Failed! Retries left: ${retries}`);
-      console.error(`❌ Error: ${err.message}`);
-      if (retries === 0) {
-        console.error('❌ FATAL: MongoDB connection failed after 5 retries. Exiting...');
-        process.exit(1);
-      }
-      console.log('⏳ Retrying in 5 seconds...');
+      console.error(`❌ MongoDB failed. Retries left: ${i-1} | ${err.message}`);
+      if (i === 1) { process.exit(1); }
       await new Promise(r => setTimeout(r, 5000));
     }
   }
 }
 
-mongoose.connection.on('disconnected', () => {
-  console.warn('⚠️ MongoDB Disconnected! Attempting reconnect...');
-});
-mongoose.connection.on('reconnected', () => {
-  console.log('✅ MongoDB Reconnected!');
-});
-mongoose.connection.on('error', (err) => {
-  console.error('❌ MongoDB Runtime Error:', err.message);
-});
+mongoose.connection.on('disconnected', () => console.warn('⚠️ MongoDB Disconnected'));
+mongoose.connection.on('reconnected',  () => console.log('✅ MongoDB Reconnected'));
+mongoose.connection.on('error', err    => console.error('❌ MongoDB Error:', err.message));
 
 // ─── SCHEMAS ──────────────────────────────────────────────────────────────────
-const userSchema = new mongoose.Schema({
+const User = mongoose.model('User', new mongoose.Schema({
   userId:      { type: Number, unique: true },
   username:    String,
   firstName:   String,
@@ -73,9 +74,9 @@ const userSchema = new mongoose.Schema({
     approvedAt: Date
   }],
   joinedAt: { type: Date, default: Date.now }
-});
+}));
 
-const paymentSchema = new mongoose.Schema({
+const Payment = mongoose.model('Payment', new mongoose.Schema({
   orderId:          String,
   userId:           Number,
   username:         String,
@@ -87,1094 +88,728 @@ const paymentSchema = new mongoose.Schema({
   adminMsgId:       Number,
   status:           { type: String, default: 'pending' },
   submittedAt:      { type: Date, default: Date.now }
-});
+}));
 
-const settingsSchema = new mongoose.Schema({
+const Settings = mongoose.model('Settings', new mongoose.Schema({
   key:   { type: String, unique: true },
   value: mongoose.Schema.Types.Mixed
-});
+}));
 
-const User     = mongoose.model('User',     userSchema);
-const Payment  = mongoose.model('Payment',  paymentSchema);
-const Settings = mongoose.model('Settings', settingsSchema);
-
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function generateOrderId() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let r1 = '', r2 = '';
-  for (let i = 0; i < 8; i++) r1 += chars[Math.floor(Math.random() * chars.length)];
-  for (let i = 0; i < 4; i++) r2 += chars[Math.floor(Math.random() * chars.length)];
-  return `ORD-${r1}-${r2}`;
-}
-
-async function getSetting(key, defaultVal = null) {
+// ─── SETTINGS HELPERS ─────────────────────────────────────────────────────────
+async function getSetting(key, def = null) {
   try {
     const s = await Settings.findOne({ key });
-    return s ? s.value : defaultVal;
-  } catch (err) {
-    console.error(`❌ getSetting error [${key}]:`, err.message);
-    return defaultVal;
-  }
+    return s ? s.value : def;
+  } catch { return def; }
 }
 
 async function setSetting(key, value) {
   try {
     await Settings.findOneAndUpdate({ key }, { key, value }, { upsert: true, new: true });
   } catch (err) {
-    console.error(`❌ setSetting error [${key}]:`, err.message);
+    console.error(`❌ setSetting[${key}]:`, err.message);
   }
 }
 
+// ─── DEFAULT PLANS ────────────────────────────────────────────────────────────
 const DEFAULT_PLANS = [
-  { id: 'plan_1',  name: '🌽ᴄʜ1ʟᴅ ᴄ0ʀɴ🌽',             price: 59,  days: 30,     desc: '🌽CH1LD C0RN🌽',                                                           link: '', demo: '' },
-  { id: 'plan_2',  name: '🌽🌽 ᴀʟʟ ᴛʏᴘᴇ',               price: 199, days: 999999, desc: 'All types c0rn🌽 — LIFETIME',                                               link: '', demo: '' },
-  { id: 'plan_3',  name: '💦ʀᴇᴀʟ ɪɴᴅ!ᴀɴ ᴅēsɪ ᴘ0ʀɴ 💦', price: 99,  days: 30,     desc: '💦 Full Desi Indian content approx 40000+ videos💦',                        link: '', demo: '' },
-  { id: 'plan_4',  name: '👻ɢ0ʀᴇ ʀ@ᴘᴇ💦',               price: 99,  days: 30,     desc: '✨10000+ Mom&Son Videos\n✨6000+ R@pe Videos\n✨New Content Regularly',      link: '', demo: '' },
-  { id: 'plan_5',  name: '🥵 ʜᴏᴛ ᴅᴇsɪ ʙʜᴀʙʜɪ 🥵',      price: 69,  days: 30,     desc: '💦New Desi Bhabhi Best P0rn💦',                                             link: '', demo: '' },
-  { id: 'plan_6',  name: '🫦ᴄᴏʟʟᴇɢᴇ ʟᴇᴀᴋᴇs 🫦',         price: 69,  days: 30,     desc: 'College girls ki videos💦🫦',                                               link: '', demo: '' },
-  { id: 'plan_7',  name: 'ᴀᴅɪᴛʏ ᴍɪsʀʏ ᴀʟʟ 😋',         price: 89,  days: 30,     desc: 'ADITI MISRY SHOWS 🫦',                                                      link: '', demo: '' },
-  { id: 'plan_8',  name: '😘 ᴍᴏᴍ ᴀɴᴅ sᴏɴ 😘',          price: 59,  days: 30,     desc: '😘 MOM AND SON 😘',                                                         link: '', demo: '' },
-  { id: 'plan_9',  name: '✂️ ʟᴇsʙɪᴀɴs ✂️',              price: 49,  days: 30,     desc: 'LESBIANS 🫦✂️',                                                             link: '', demo: '' },
-  { id: 'plan_10', name: 'ɪɴᴅɪᴀɴ ᴡᴇʙsᴇʀɪᴇs 😋🫦',       price: 99,  days: 30,     desc: 'WEBSERIES 🫦',                                                              link: '', demo: '' },
-  { id: 'plan_11', name: '💦 ᴅᴇsɪ ᴘɪssɪɴɢ 💦',          price: 79,  days: 30,     desc: 'PISSING 🫦💦',                                                              link: '', demo: '' }
+  { id:'plan_1',  name:'🌽ᴄʜ1ʟᴅ ᴄ0ʀɴ🌽',             price:59,  days:30,     desc:'🌽CH1LD C0RN🌽',                                          link:'', demo:'' },
+  { id:'plan_2',  name:'🌽🌽 ᴀʟʟ ᴛʏᴘᴇ',               price:199, days:999999, desc:'All types c0rn🌽 LIFETIME',                                link:'', demo:'' },
+  { id:'plan_3',  name:'💦ʀᴇᴀʟ ɪɴᴅ!ᴀɴ ᴅēsɪ ᴘ0ʀɴ 💦', price:99,  days:30,     desc:'💦 Full Desi Indian 40000+ videos💦',                      link:'', demo:'' },
+  { id:'plan_4',  name:'👻ɢ0ʀᴇ ʀ@ᴘᴇ💦',               price:99,  days:30,     desc:'✨10000+ Mom&Son\n✨6000+ R@pe Videos\n✨New Content',       link:'', demo:'' },
+  { id:'plan_5',  name:'🥵 ʜᴏᴛ ᴅᴇsɪ ʙʜᴀʙʜɪ 🥵',      price:69,  days:30,     desc:'💦New Desi Bhabhi Best P0rn💦',                            link:'', demo:'' },
+  { id:'plan_6',  name:'🫦ᴄᴏʟʟᴇɢᴇ ʟᴇᴀᴋᴇs 🫦',         price:69,  days:30,     desc:'College girls ki videos💦🫦',                              link:'', demo:'' },
+  { id:'plan_7',  name:'ᴀᴅɪᴛʏ ᴍɪsʀʏ ᴀʟʟ 😋',         price:89,  days:30,     desc:'ADITI MISRY SHOWS 🫦',                                     link:'', demo:'' },
+  { id:'plan_8',  name:'😘 ᴍᴏᴍ ᴀɴᴅ sᴏɴ 😘',          price:59,  days:30,     desc:'😘 MOM AND SON 😘',                                        link:'', demo:'' },
+  { id:'plan_9',  name:'✂️ ʟᴇsʙɪᴀɴs ✂️',              price:49,  days:30,     desc:'LESBIANS 🫦✂️',                                            link:'', demo:'' },
+  { id:'plan_10', name:'ɪɴᴅɪᴀɴ ᴡᴇʙsᴇʀɪᴇs 😋🫦',       price:99,  days:30,     desc:'WEBSERIES 🫦',                                             link:'', demo:'' },
+  { id:'plan_11', name:'💦 ᴅᴇsɪ ᴘɪssɪɴɢ 💦',          price:79,  days:30,     desc:'PISSING 🫦💦',                                             link:'', demo:'' }
 ];
 
 async function getPlans() {
-  try {
-    return await getSetting('plans', DEFAULT_PLANS);
-  } catch (err) {
-    console.error('❌ getPlans error:', err.message);
-    return DEFAULT_PLANS;
-  }
+  return await getSetting('plans', DEFAULT_PLANS);
 }
-
 async function savePlans(plans) {
   await setSetting('plans', plans);
 }
 
-// ─── STATE ────────────────────────────────────────────────────────────────────
+// ─── ORDER ID ────────────────────────────────────────────────────────────────
+function generateOrderId() {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const r = (n) => Array.from({length:n}, () => c[Math.floor(Math.random()*c.length)]).join('');
+  return `ORD-${r(8)}-${r(4)}`;
+}
+
+// ─── USER STATE ───────────────────────────────────────────────────────────────
 const userState = {};
 
-// ─── BOT INIT WITH POLLING CONFLICT FIX ──────────────────────────────────────
-let bot;
+// ─── BOT INSTANCE ─────────────────────────────────────────────────────────────
+let bot = null;
+let isPolling = false;
 
-async function initBot() {
-  console.log('🤖 Initializing bot...');
+// ─── SAFE HELPERS ─────────────────────────────────────────────────────────────
+const safeDelete = async (cid, mid) => {
+  try { await bot.deleteMessage(cid, mid); } catch {}
+};
 
-  // First delete any existing webhook to avoid conflicts
-  try {
-    const axios = require('axios');
-    const deleteRes = await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook`,
-      { drop_pending_updates: true }
-    );
-    console.log('✅ Webhook deleted:', deleteRes.data.description);
-  } catch (err) {
-    console.warn('⚠️ Could not delete webhook:', err.message);
-  }
+const safeSend = async (cid, text, opts = {}) => {
+  try { return await bot.sendMessage(cid, text, opts); }
+  catch (e) { console.error(`❌ safeSend(${cid}):`, e.message); }
+};
 
-  // Small delay after deleting webhook
-  await new Promise(r => setTimeout(r, 2000));
+const safeEdit = async (text, opts = {}) => {
+  try { return await bot.editMessageText(text, opts); }
+  catch (e) { if (!e.message?.includes('not modified')) console.error('❌ safeEdit:', e.message); }
+};
 
-  bot = new TelegramBot(BOT_TOKEN, {
-    polling: {
-      interval: 300,
-      autoStart: true,
-      params: {
-        timeout: 10,
-        allowed_updates: ['message', 'callback_query']
-      }
-    }
-  });
+const safeEditCaption = async (caption, opts = {}) => {
+  try { return await bot.editMessageCaption(caption, opts); }
+  catch (e) { if (!e.message?.includes('not modified')) console.error('❌ safeEditCaption:', e.message); }
+};
 
-  bot.on('polling_error', (err) => {
-    const code = err.code || '';
-    const msg  = err.message || '';
+const safeAnswer = async (id, opts = {}) => {
+  try { await bot.answerCallbackQuery(id, opts); } catch {}
+};
 
-    if (code === 'ETELEGRAM' && msg.includes('409')) {
-      console.error('❌ POLLING CONFLICT (409): Another bot instance is running!');
-      console.error('⏳ Waiting 15 seconds then restarting polling...');
-      bot.stopPolling();
-      setTimeout(() => {
-        console.log('🔄 Restarting polling...');
-        bot.startPolling();
-      }, 15000);
-    } else if (code === 'EFATAL') {
-      console.error('❌ FATAL POLLING ERROR:', msg);
-      console.error('🔄 Restarting in 10 seconds...');
-      setTimeout(() => process.exit(1), 10000);
-    } else if (code === 'EPARSE') {
-      console.error('❌ PARSE ERROR in polling:', msg);
-    } else if (msg.includes('ETIMEDOUT') || msg.includes('ECONNRESET')) {
-      console.warn('⚠️ Network timeout in polling — will auto retry');
-    } else {
-      console.error(`❌ Polling error [${code}]:`, msg);
-    }
-  });
-
-  bot.on('error', (err) => {
-    console.error('❌ Bot general error:', err.message);
-  });
-
-  console.log('✅ Bot polling started!');
-
-  // Verify bot token
-  try {
-    const me = await bot.getMe();
-    console.log(`✅ Bot verified: @${me.username} (ID: ${me.id})`);
-  } catch (err) {
-    console.error('❌ FATAL: Bot token invalid!', err.message);
-    process.exit(1);
-  }
-
-  registerHandlers();
-}
-
-// ─── SAFE SEND HELPERS ────────────────────────────────────────────────────────
-async function safeDeleteMessage(chatId, msgId) {
-  try {
-    await bot.deleteMessage(chatId, msgId);
-  } catch (e) {
-    // Ignore delete errors
-  }
-}
-
-async function safeSendMessage(chatId, text, opts = {}) {
-  try {
-    return await bot.sendMessage(chatId, text, opts);
-  } catch (err) {
-    console.error(`❌ safeSendMessage error to ${chatId}:`, err.message);
-  }
-}
-
-async function safeEditMessageText(text, opts = {}) {
-  try {
-    return await bot.editMessageText(text, opts);
-  } catch (err) {
-    if (!err.message.includes('message is not modified')) {
-      console.error('❌ safeEditMessageText error:', err.message);
-    }
-  }
-}
-
-async function safeEditMessageCaption(caption, opts = {}) {
-  try {
-    return await bot.editMessageCaption(caption, opts);
-  } catch (err) {
-    if (!err.message.includes('message is not modified')) {
-      console.error('❌ safeEditMessageCaption error:', err.message);
-    }
-  }
-}
-
-async function safeAnswerCallback(queryId, opts = {}) {
-  try {
-    await bot.answerCallbackQuery(queryId, opts);
-  } catch (e) {
-    // Ignore
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  SEND ADMIN MENU
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── UI BUILDERS ─────────────────────────────────────────────────────────────
 async function sendAdminMenu(chatId) {
-  await safeSendMessage(chatId,
+  await safeSend(chatId,
     `👑 ᴡᴇʟᴄᴏᴍᴇ ᴀᴅᴍɪɴ!\n\n` +
-    `🤖 Bot Developed By @ZeroSpade\n\n` +
-    `━━━━━━━━━━━━━━━━━\n` +
-    `ɴɪᴄʜᴇ sᴇ ᴏᴩᴛɪᴏɴ sᴇʟᴇᴄᴛ ᴋᴀʀᴏ:\n` +
+    `🤖 Bot Developed By @ZeroSpade\n` +
     `━━━━━━━━━━━━━━━━━`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '💰 Change Price', callback_data: 'admin_change_price' }, { text: '💳 Change UPI', callback_data: 'admin_change_upi' }],
-          [{ text: '📢 Broadcast',    callback_data: 'admin_broadcast'    }, { text: '👥 Check Users', callback_data: 'admin_check_users' }],
-          [{ text: '📊 Stats',        callback_data: 'admin_stats'        }, { text: '🔗 Links',       callback_data: 'admin_links' }]
-        ]
-      }
-    }
+    { reply_markup: { inline_keyboard: [
+      [{ text:'💰 Change Price', callback_data:'admin_change_price' }, { text:'💳 Change UPI',  callback_data:'admin_change_upi'   }],
+      [{ text:'📢 Broadcast',   callback_data:'admin_broadcast'    }, { text:'👥 Check Users', callback_data:'admin_check_users'  }],
+      [{ text:'📊 Stats',       callback_data:'admin_stats'        }, { text:'🔗 Links',       callback_data:'admin_links'        }]
+    ]}}
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  SEND HOME (User)
-// ─────────────────────────────────────────────────────────────────────────────
 async function sendHome(chatId, firstName) {
-  const displayName = `𝘚𝘱𝘢𝘥𝘦 • ${firstName}`;
-  await safeSendMessage(chatId,
-    `👋 ʜᴇʟʟᴏ ${displayName}!\n\n` +
+  await safeSend(chatId,
+    `👋 ʜᴇʟʟᴏ 𝘚𝘱𝘢𝘥𝘦 • ${firstName}!\n\n` +
     `🌟 ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ ʙᴏᴛ\n\n` +
     `━━━━━━━━━━━━━━━━━\n` +
     `💎 ᴘʀᴇᴍɪᴜᴍ ᴘʀɪᴄᴇ: ₹49 - ₹199\n` +
     `📦 ᴘʟᴀɴs: 11 ᴘʟᴀɴs ᴀᴠᴀɪʟᴀʙʟᴇ\n` +
     `━━━━━━━━━━━━━━━━━\n\n` +
-    `🔒 ᴘʀᴇᴍɪᴜᴍ ᴄᴏɴᴛᴇɴᴛ ᴀᴄᴄᴇss ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ᴘʀᴇᴍɪᴜᴍ ʟᴏ!`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: 'BUY PREMIUM 💦',  callback_data: 'buy_premium'  }],
-          [{ text: '💫 MY PREMIUMS',  callback_data: 'my_premiums'  }, { text: '👤 MY PROFILE', callback_data: 'my_profile' }],
-          [{ text: '👀 VIEW DEMO',    callback_data: 'view_demo_0'  }]
-        ]
-      }
-    }
+    `🔒 ᴘʀᴇᴍɪᴜᴍ ʟᴇɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴄʟɪᴄᴋ ᴋᴀʀᴏ!`,
+    { reply_markup: { inline_keyboard: [
+      [{ text:'BUY PREMIUM 💦',  callback_data:'buy_premium'  }],
+      [{ text:'💫 MY PREMIUMS',  callback_data:'my_premiums'  }, { text:'👤 MY PROFILE', callback_data:'my_profile'  }],
+      [{ text:'👀 VIEW DEMO',    callback_data:'view_demo_0'  }]
+    ]}}
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  REGISTER ALL HANDLERS
+//  HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
 function registerHandlers() {
 
-  // ── /start ──────────────────────────────────────────────────────────────────
+  // /start
   bot.onText(/\/start/, async (msg) => {
     try {
-      const chatId    = msg.chat.id;
-      const userId    = msg.from.id;
-      const firstName = msg.from.first_name || 'User';
-      const username  = msg.from.username   || '';
+      const { id: chatId } = msg.chat;
+      const { id: userId, first_name, username } = msg.from;
+      const firstName = first_name || 'User';
 
-      console.log(`📩 /start from ${firstName} (${userId})`);
-
-      // Save/update user
       await User.findOneAndUpdate(
         { userId },
-        { userId, username, firstName },
+        { userId, username: username || '', firstName },
         { upsert: true, setDefaultsOnInsert: true }
       );
 
       if (String(userId) === String(ADMIN_ID)) {
         return sendAdminMenu(chatId);
       }
-
       return sendHome(chatId, firstName);
-    } catch (err) {
-      console.error('❌ /start handler error:', err.message);
-    }
+    } catch (e) { console.error('❌ /start:', e.message); }
   });
 
-  // ── /admin ───────────────────────────────────────────────────────────────────
+  // /admin
   bot.onText(/\/admin/, async (msg) => {
     try {
       if (String(msg.from.id) !== String(ADMIN_ID)) return;
       return sendAdminMenu(msg.chat.id);
-    } catch (err) {
-      console.error('❌ /admin handler error:', err.message);
-    }
+    } catch (e) { console.error('❌ /admin:', e.message); }
   });
 
-  // ── CALLBACK QUERIES ─────────────────────────────────────────────────────────
+  // CALLBACKS
   bot.on('callback_query', async (query) => {
-    const chatId  = query.message.chat.id;
-    const userId  = query.from.id;
-    const msgId   = query.message.message_id;
-    const data    = query.data;
-    const isAdmin = String(userId) === String(ADMIN_ID);
+    const chatId    = query.message.chat.id;
+    const userId    = query.from.id;
+    const msgId     = query.message.message_id;
+    const data      = query.data;
+    const isAdmin   = String(userId) === String(ADMIN_ID);
     const firstName = query.from.first_name || 'User';
 
-    await safeAnswerCallback(query.id);
-
-    console.log(`🔘 Callback [${data}] from ${firstName} (${userId})`);
+    await safeAnswer(query.id);
 
     try {
-
-      // ── BUY PREMIUM ───────────────────────────────────────────────────────────
+      // ── BUY PREMIUM
       if (data === 'buy_premium') {
         const plans = await getPlans();
-        await safeDeleteMessage(chatId, msgId);
-
+        await safeDelete(chatId, msgId);
         let text = `💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs\n\n━━━━━━━━━━━━━━━━━\n`;
         for (const p of plans) {
-          const validity = p.days >= 999999 ? 'LIFETIME' : `${p.days} DAYS`;
-          text += `🔹 ${p.name}\n   💰 ᴘʀɪᴄᴇ: ₹${p.price}\n   ⏳ ᴠᴀʟɪᴅɪᴛʏ: ${validity}\n   📌 ${p.desc}\n\n`;
+          const v = p.days >= 999999 ? 'LIFETIME' : `${p.days} DAYS`;
+          text += `🔹 ${p.name}\n   💰 ₹${p.price} | ⏳ ${v}\n   📌 ${p.desc}\n\n`;
         }
-        text += `━━━━━━━━━━━━━━━━━\n👇 sᴇʟᴇᴄᴛ ʏᴏᴜʀ ᴘʟᴀɴ ʙᴇʟᴏᴡ`;
-
-        const keyboard = plans.map(p => {
+        text += `━━━━━━━━━━━━━━━━━\n👇 ᴘʟᴀɴ sᴇʟᴇᴄᴛ ᴋᴀʀᴏ`;
+        const kb = plans.map(p => {
           const v = p.days >= 999999 ? 'LIFETIME' : `${p.days}D`;
-          return [{ text: `${p.name} • ₹${p.price} • ${v}`, callback_data: `select_plan_${p.id}` }];
+          return [{ text:`${p.name} • ₹${p.price} • ${v}`, callback_data:`sp_${p.id}` }];
         });
-        keyboard.push([{ text: '🏠 Back Home', callback_data: 'back_home' }]);
-
-        await safeSendMessage(chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+        kb.push([{ text:'🏠 Back Home', callback_data:'back_home' }]);
+        await safeSend(chatId, text, { reply_markup:{ inline_keyboard: kb } });
         return;
       }
 
-      // ── SELECT PLAN ───────────────────────────────────────────────────────────
-      if (data.startsWith('select_plan_')) {
-        const planId = data.replace('select_plan_', '');
+      // ── SELECT PLAN
+      if (data.startsWith('sp_')) {
+        const planId = data.replace('sp_', '');
         const plans  = await getPlans();
         const plan   = plans.find(p => p.id === planId);
         if (!plan) return;
 
         const upiId   = await getSetting('upi_id',   'Sakib006@ybl');
         const upiName = await getSetting('upi_name', 'Sakib');
-        const validity = plan.days >= 999999 ? 'LIFETIME' : `${plan.days} DAYS`;
+        const v = plan.days >= 999999 ? 'LIFETIME' : `${plan.days} DAYS`;
 
-        await safeDeleteMessage(chatId, msgId);
+        await safeDelete(chatId, msgId);
 
-        // Generate QR
-        let qrBuffer;
+        let qrBuffer = null;
         try {
           const upiUri = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(upiName)}&am=${plan.price}&cu=INR`;
-          qrBuffer = await QRCode.toBuffer(upiUri, { width: 300, margin: 2 });
-        } catch (qrErr) {
-          console.error('❌ QR generation error:', qrErr.message);
-        }
+          qrBuffer = await QRCode.toBuffer(upiUri, { width:300, margin:2 });
+        } catch (e) { console.error('❌ QR error:', e.message); }
 
         const caption =
           `💳 ᴘᴀʏᴍᴇɴᴛ ᴅᴇᴛᴀɪʟs\n\n` +
           `━━━━━━━━━━━━━━━━━\n` +
           `📦 ᴘʟᴀɴ: ${plan.name}\n` +
           `💰 ᴀᴍᴏᴜɴᴛ: ₹${plan.price}\n` +
-          `⏳ ᴠᴀʟɪᴅɪᴛʏ: ${validity}\n` +
+          `⏳ ᴠᴀʟɪᴅɪᴛʏ: ${v}\n` +
           `━━━━━━━━━━━━━━━━━\n\n` +
           `👤 ɴᴀᴍᴇ: ${upiName}\n` +
-          `📱 UPI ID: \`${upiId}\`\n\n` +
+          `📱 UPI: ${upiId}\n\n` +
           `📋 sᴛᴇᴘs:\n` +
-          `1️⃣ UPI ID ᴘᴇ ₹${plan.price} ʙʜᴇᴊᴏ\n` +
-          `2️⃣ ᴘᴀʏᴍᴇɴᴛ sᴄʀᴇᴇɴsʜᴏᴛ ʟᴏ\n` +
-          `3️⃣ ɴɪᴄʜᴇ SUBMIT PROOF ᴅᴀʙᴀᴏ\n\n` +
-          `⚠️ ᴠᴇʀɪꜰʏ ʜᴏɴᴇ ᴍᴇɪɴ 24 ʜᴏᴜʀs ʟᴀɢ sᴀᴋᴛᴇ ʜᴀɪɴ`;
+          `1️⃣ UPI ᴘᴇ ₹${plan.price} ʙʜᴇᴊᴏ\n` +
+          `2️⃣ sᴄʀᴇᴇɴsʜᴏᴛ ʟᴏ\n` +
+          `3️⃣ SUBMIT PROOF ᴅᴀʙᴀᴏ\n\n` +
+          `⚠️ ᴠᴇʀɪꜰʏ ᴍᴇɪɴ 24ʜ ʟᴀɢ sᴀᴋᴛᴇ ʜᴀɪɴ`;
 
-        const keyboard = {
-          inline_keyboard: [
-            [{ text: '📸 SUBMIT PROOF', callback_data: `submit_proof_${planId}` }],
-            [{ text: '🔙 BACK TO PLANS', callback_data: 'buy_premium' }]
-          ]
-        };
+        const kb = { inline_keyboard:[
+          [{ text:'📸 SUBMIT PROOF', callback_data:`proof_${planId}` }],
+          [{ text:'🔙 BACK TO PLANS', callback_data:'buy_premium' }]
+        ]};
 
-        userState[userId] = { action: 'awaiting_screenshot', planId };
+        userState[userId] = { action:'awaiting_screenshot', planId };
 
         if (qrBuffer) {
-          await bot.sendPhoto(chatId, qrBuffer, {
-            caption,
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-          }).catch(err => console.error('❌ sendPhoto error:', err.message));
+          await bot.sendPhoto(chatId, qrBuffer, { caption, reply_markup: kb })
+            .catch(e => console.error('❌ sendPhoto:', e.message));
         } else {
-          await safeSendMessage(chatId, caption, {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-          });
+          await safeSend(chatId, caption, { reply_markup: kb });
         }
         return;
       }
 
-      // ── SUBMIT PROOF ──────────────────────────────────────────────────────────
-      if (data.startsWith('submit_proof_')) {
-        const planId = data.replace('submit_proof_', '');
-        userState[userId] = { action: 'awaiting_screenshot', planId };
-        await safeDeleteMessage(chatId, msgId);
-        await safeSendMessage(chatId,
+      // ── SUBMIT PROOF
+      if (data.startsWith('proof_')) {
+        const planId = data.replace('proof_', '');
+        userState[userId] = { action:'awaiting_screenshot', planId };
+        await safeDelete(chatId, msgId);
+        await safeSend(chatId,
           `📸 ᴘᴀʏᴍᴇɴᴛ sᴄʀᴇᴇɴsʜᴏᴛ ʙʜᴇᴊᴏ\n\n` +
-          `✅ UPI ᴘᴀʏᴍᴇɴᴛ ᴋᴀʀɴᴇ ᴋᴇ ʙᴀᴀᴅ sᴄʀᴇᴇɴsʜᴏᴛ ʏᴀʜᴀɴ ʙʜᴇᴊᴏ.\n\n` +
-          `⚠️ sɪʀꜰ ɪᴍᴀɢᴇ/sᴄʀᴇᴇɴsʜᴏᴛ ᴀᴄᴄᴇᴘᴛ ʜᴏɢᴀ`,
-          { reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'back_home' }]] } }
+          `✅ Payment ke baad screenshot yahan bhejo\n` +
+          `⚠️ Sirf image/screenshot accept hoga`,
+          { reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'back_home' }]] }}
         );
         return;
       }
 
-      // ── MY PREMIUMS ───────────────────────────────────────────────────────────
+      // ── MY PREMIUMS
       if (data === 'my_premiums') {
-        const user = await User.findOne({ userId });
-        const now  = new Date();
+        await safeDelete(chatId, msgId);
+        const user   = await User.findOne({ userId });
+        const now    = new Date();
         const active = user?.activePlans?.filter(p => new Date(p.expiresAt) > now) || [];
-
-        await safeDeleteMessage(chatId, msgId);
-
         if (!active.length) {
-          await safeSendMessage(chatId,
-            `💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵\n\n` +
-            `━━━━━━━━━━━━━━━━━\n` +
-            `❌ ᴀᴀᴘᴋᴇ ᴘᴀᴀs ᴋᴏɪ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ɴᴀʜɪ ʜᴀɪ!\n\n` +
-            `ᴘʀᴇᴍɪᴜᴍ ʟᴇɴᴇ ᴋᴇ ʟɪʏᴇ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ᴅᴀʙᴀᴏ.\n` +
+          await safeSend(chatId,
+            `💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵\n\n━━━━━━━━━━━━━━━━━\n` +
+            `❌ ᴀᴀᴘᴋᴇ ᴘᴀᴀs ᴋᴏɪ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ɴᴀʜɪ ʜᴀɪ!\n` +
             `━━━━━━━━━━━━━━━━━`,
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: 'BUY PREMIUM 💦', callback_data: 'buy_premium' }],
-                  [{ text: '🏠 Back Home',   callback_data: 'back_home'   }]
-                ]
-              }
-            }
+            { reply_markup:{ inline_keyboard:[
+              [{ text:'BUY PREMIUM 💦', callback_data:'buy_premium' }],
+              [{ text:'🏠 Back Home',   callback_data:'back_home'   }]
+            ]}}
           );
         } else {
           let text = `💎 ᴍʏ ᴘʀᴇᴍɪᴜᴍs 🥵\n\n━━━━━━━━━━━━━━━━━\n`;
           for (const p of active) {
-            const expStr = new Date(p.expiresAt).getFullYear() > 2090
-              ? 'LIFETIME'
-              : new Date(p.expiresAt).toDateString();
-            text += `✅ ${p.planName}\n⏳ Expires: ${expStr}\n\n`;
+            const exp = new Date(p.expiresAt).getFullYear() > 2090 ? 'LIFETIME' : new Date(p.expiresAt).toDateString();
+            text += `✅ ${p.planName}\n⏳ Expires: ${exp}\n\n`;
           }
           text += `━━━━━━━━━━━━━━━━━`;
-          await safeSendMessage(chatId, text, {
-            reply_markup: {
-              inline_keyboard: [[{ text: '🏠 Back Home', callback_data: 'back_home' }]]
-            }
-          });
+          await safeSend(chatId, text, { reply_markup:{ inline_keyboard:[[{ text:'🏠 Back Home', callback_data:'back_home' }]] }});
         }
         return;
       }
 
-      // ── MY PROFILE ────────────────────────────────────────────────────────────
+      // ── MY PROFILE
       if (data === 'my_profile') {
+        await safeDelete(chatId, msgId);
         const user     = await User.findOne({ userId });
         const payments = await Payment.find({ userId });
         const approved = payments.filter(p => p.status === 'approved').length;
         const pending  = payments.filter(p => p.status === 'pending').length;
-        const total    = payments.length;
         const now      = new Date();
         const active   = user?.activePlans?.filter(p => new Date(p.expiresAt) > now) || [];
+        const joined   = user?.joinedAt?.toISOString().replace('T',' ').substring(0,19) || 'N/A';
 
-        const joinedStr = user?.joinedAt
-          ? user.joinedAt.toISOString().replace('T', ' ').substring(0, 19)
-          : 'N/A';
-
-        await safeDeleteMessage(chatId, msgId);
-        await safeSendMessage(chatId,
-          `👤 ᴍʏ ᴘʀᴏꜰɪʟᴇ\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `🙍 ɴᴀᴍᴇ: ${query.from.first_name || ''} ${query.from.last_name || ''}\n` +
-          `📛 ᴜsᴇʀɴᴀᴍᴇ: @${query.from.username || 'N/A'}\n` +
+        await safeSend(chatId,
+          `👤 ᴍʏ ᴘʀᴏꜰɪʟᴇ\n\n━━━━━━━━━━━━━━━━━\n` +
+          `🙍 ɴᴀᴍᴇ: ${query.from.first_name||''} ${query.from.last_name||''}\n` +
+          `📛 ᴜsᴇʀɴᴀᴍᴇ: @${query.from.username||'N/A'}\n` +
           `🆔 ID: ${userId}\n` +
-          `📅 ᴊᴏɪɴᴇᴅ: ${joinedStr}\n` +
+          `📅 ᴊᴏɪɴᴇᴅ: ${joined}\n` +
           `━━━━━━━━━━━━━━━━━\n` +
-          `💎 ᴘʀᴇᴍɪᴜᴍ sᴛᴀᴛᴜs: ${active.length > 0 ? '✅ ᴀᴄᴛɪᴠᴇ' : '❌ ɴᴏᴛ ᴀᴄᴛɪᴠᴇ'}\n` +
+          `💎 ᴘʀᴇᴍɪᴜᴍ: ${active.length > 0 ? '✅ ᴀᴄᴛɪᴠᴇ' : '❌ ɴᴏᴛ ᴀᴄᴛɪᴠᴇ'}\n` +
           `━━━━━━━━━━━━━━━━━\n` +
           `💳 ᴘᴀʏᴍᴇɴᴛ ʜɪsᴛᴏʀʏ:\n` +
           `   ✅ ᴀᴘᴘʀᴏᴠᴇᴅ: ${approved}\n` +
           `   ⏳ ᴘᴇɴᴅɪɴɢ:  ${pending}\n` +
-          `   📊 ᴛᴏᴛᴀʟ:   ${total}\n` +
+          `   📊 ᴛᴏᴛᴀʟ:   ${payments.length}\n` +
           `━━━━━━━━━━━━━━━━━`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: 'BUY PREMIUM 💦', callback_data: 'buy_premium' }],
-                [{ text: '🏠 Back Home',   callback_data: 'back_home'   }]
-              ]
-            }
-          }
+          { reply_markup:{ inline_keyboard:[
+            [{ text:'BUY PREMIUM 💦', callback_data:'buy_premium' }],
+            [{ text:'🏠 Back Home',   callback_data:'back_home'   }]
+          ]}}
         );
         return;
       }
 
-      // ── VIEW DEMO ─────────────────────────────────────────────────────────────
+      // ── VIEW DEMO
       if (data.startsWith('view_demo_')) {
-        const idx   = parseInt(data.replace('view_demo_', '')) || 0;
+        const idx   = parseInt(data.replace('view_demo_','')) || 0;
         const plans = await getPlans();
-        if (!plans.length) return;
-        const safeIdx = Math.max(0, Math.min(idx, plans.length - 1));
-        const plan    = plans[safeIdx];
-        const validity = plan.days >= 999999 ? 'LIFETIME' : `${plan.days} DAYS`;
-        const demoChannel = await getSetting('demo_channel', 'https://t.me/yourchannel');
-
-        await safeDeleteMessage(chatId, msgId);
-        await safeSendMessage(chatId,
-          `👀 ᴅᴇᴍᴏ: ${plan.name}\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `💰 ᴘʀɪᴄᴇ: ₹${plan.price}\n` +
-          `⏳ ᴠᴀʟɪᴅɪᴛʏ: ${validity}\n` +
-          `━━━━━━━━━━━━━━━━━`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '👀 OPEN DEMO', url: demoChannel }],
-                [
-                  { text: '⬅️ Prev', callback_data: `view_demo_${safeIdx > 0 ? safeIdx - 1 : plans.length - 1}` },
-                  { text: `${safeIdx + 1}/${plans.length}`, callback_data: 'noop' },
-                  { text: '➡️ Next', callback_data: `view_demo_${(safeIdx + 1) % plans.length}` }
-                ],
-                [{ text: '💎 Get Premium', callback_data: 'buy_premium' }, { text: '🏠 Back Home', callback_data: 'back_home' }]
-              ]
-            }
-          }
+        const i     = Math.max(0, Math.min(idx, plans.length - 1));
+        const plan  = plans[i];
+        const v     = plan.days >= 999999 ? 'LIFETIME' : `${plan.days} DAYS`;
+        const demo  = await getSetting('demo_channel', 'https://t.me/yourchannel');
+        await safeDelete(chatId, msgId);
+        await safeSend(chatId,
+          `👀 ᴅᴇᴍᴏ: ${plan.name}\n\n━━━━━━━━━━━━━━━━━\n` +
+          `💰 ᴘʀɪᴄᴇ: ₹${plan.price}\n⏳ ᴠᴀʟɪᴅɪᴛʏ: ${v}\n━━━━━━━━━━━━━━━━━`,
+          { reply_markup:{ inline_keyboard:[
+            [{ text:'👀 OPEN DEMO', url: demo }],
+            [
+              { text:'⬅️ Prev', callback_data:`view_demo_${i > 0 ? i-1 : plans.length-1}` },
+              { text:`${i+1}/${plans.length}`, callback_data:'noop' },
+              { text:'➡️ Next', callback_data:`view_demo_${(i+1) % plans.length}` }
+            ],
+            [{ text:'💎 Get Premium', callback_data:'buy_premium' }, { text:'🏠 Back Home', callback_data:'back_home' }]
+          ]}}
         );
         return;
       }
 
-      // ── BACK HOME ─────────────────────────────────────────────────────────────
+      // ── BACK HOME
       if (data === 'back_home') {
-        await safeDeleteMessage(chatId, msgId);
+        await safeDelete(chatId, msgId);
         if (isAdmin) return sendAdminMenu(chatId);
         return sendHome(chatId, firstName);
       }
 
-      // ══════════════════════════════════════════════════════════════════════════
-      //  ADMIN CALLBACKS
-      // ══════════════════════════════════════════════════════════════════════════
-      if (!isAdmin) {
-        console.warn(`⚠️ Non-admin (${userId}) tried admin action: ${data}`);
-        return;
-      }
+      // ── NOOP
+      if (data === 'noop') return;
 
-      // ── ADMIN: CHANGE PRICE ───────────────────────────────────────────────────
+      // ════════════════════════════════════════════════════
+      //  ADMIN ONLY BEYOND THIS POINT
+      // ════════════════════════════════════════════════════
+      if (!isAdmin) return;
+
+      // ── CHANGE PRICE
       if (data === 'admin_change_price') {
         const plans = await getPlans();
-        const keyboard = plans.map(p => ([{ text: `${p.name} — ₹${p.price}`, callback_data: `admin_price_plan_${p.id}` }]));
-        keyboard.push([{ text: '🔙 Back', callback_data: 'admin_back' }]);
-        await safeEditMessageText(`💰 Kaun se plan ka price change karna hai?`, {
-          chat_id: chatId, message_id: msgId,
-          reply_markup: { inline_keyboard: keyboard }
+        const kb = plans.map(p => [{ text:`${p.name} — ₹${p.price}`, callback_data:`acp_${p.id}` }]);
+        kb.push([{ text:'🔙 Back', callback_data:'admin_back' }]);
+        await safeEdit(`💰 Kaun se plan ka price change karna hai?`, { chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:kb } });
+        return;
+      }
+
+      if (data.startsWith('acp_')) {
+        const planId = data.replace('acp_','');
+        userState[userId] = { action:'admin_set_price', planId };
+        await safeEdit(`💰 Naya price bhejo (only number, e.g. 99):`, {
+          chat_id:chatId, message_id:msgId,
+          reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'admin_back' }]] }
         });
         return;
       }
 
-      if (data.startsWith('admin_price_plan_')) {
-        const planId = data.replace('admin_price_plan_', '');
-        userState[userId] = { action: 'admin_set_price', planId, msgId };
-        await safeEditMessageText(`💰 Naya price bhejo (sirf number, e.g. 99):`, {
-          chat_id: chatId, message_id: msgId,
-          reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_back' }]] }
-        });
-        return;
-      }
-
-      // ── ADMIN: CHANGE UPI ─────────────────────────────────────────────────────
+      // ── CHANGE UPI
       if (data === 'admin_change_upi') {
-        const curId   = await getSetting('upi_id',   'Sakib006@ybl');
-        const curName = await getSetting('upi_name', 'Sakib');
-        userState[userId] = { action: 'admin_set_upi' };
-        await safeEditMessageText(
-          `💳 Current UPI:\nID: ${curId}\nName: ${curName}\n\nNaya format me bhejo:\n<UPI_ID>|<NAME>\n\nExample: newupi@ybl|Rahul`,
-          {
-            chat_id: chatId, message_id: msgId,
-            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_back' }]] }
-          }
+        const id   = await getSetting('upi_id', 'Sakib006@ybl');
+        const name = await getSetting('upi_name', 'Sakib');
+        userState[userId] = { action:'admin_set_upi' };
+        await safeEdit(
+          `💳 Current UPI:\nID: ${id}\nName: ${name}\n\nNew format:\nUPI_ID|NAME\nE.g: newupi@ybl|Rahul`,
+          { chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'admin_back' }]] }}
         );
         return;
       }
 
-      // ── ADMIN: BROADCAST ──────────────────────────────────────────────────────
+      // ── BROADCAST
       if (data === 'admin_broadcast') {
-        userState[userId] = { action: 'admin_broadcast' };
-        await safeEditMessageText(
-          `📢 Broadcast message bhejo:\n\n` +
-          `✅ Text, Image, Video sab support hai\n` +
-          `✅ Caption bhi support hai\n` +
-          `✅ Koi bhi font style use karo`,
-          {
-            chat_id: chatId, message_id: msgId,
-            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_back' }]] }
-          }
+        userState[userId] = { action:'admin_broadcast' };
+        await safeEdit(
+          `📢 Broadcast message bhejo:\n✅ Text/Image/Video/GIF/Sticker sab support hai\n✅ Koi bhi font use karo`,
+          { chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'admin_back' }]] }}
         );
         return;
       }
 
-      // ── ADMIN: CHECK USERS ────────────────────────────────────────────────────
+      // ── CHECK USERS
       if (data === 'admin_check_users') {
-        const totalUsers = await User.countDocuments();
-        const today = new Date(); today.setHours(0, 0, 0, 0);
-        const todayUsers   = await User.countDocuments({ joinedAt: { $gte: today } });
-        const last24h      = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        const last24hCount = await User.countDocuments({ joinedAt: { $gte: last24h } });
-        const perHour      = (last24hCount / 24).toFixed(1);
-
-        await safeEditMessageText(
-          `👥 ᴜsᴇʀ sᴛᴀᴛs\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `👤 Total Users: ${totalUsers}\n` +
-          `📅 Today's Users: ${todayUsers}\n` +
-          `⏱️ Avg/Hour (24h): ${perHour}\n` +
+        const total   = await User.countDocuments();
+        const today   = new Date(); today.setHours(0,0,0,0);
+        const todayN  = await User.countDocuments({ joinedAt:{ $gte:today } });
+        const last24  = new Date(Date.now() - 86400000);
+        const last24N = await User.countDocuments({ joinedAt:{ $gte:last24 } });
+        await safeEdit(
+          `👥 ᴜsᴇʀ sᴛᴀᴛs\n\n━━━━━━━━━━━━━━━━━\n` +
+          `👤 Total Users: ${total}\n` +
+          `📅 Today: ${todayN}\n` +
+          `⏱️ Avg/Hour (24h): ${(last24N/24).toFixed(1)}\n` +
           `━━━━━━━━━━━━━━━━━`,
-          {
-            chat_id: chatId, message_id: msgId,
-            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_back' }]] }
-          }
+          { chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:[[{ text:'🔙 Back', callback_data:'admin_back' }]] }}
         );
         return;
       }
 
-      // ── ADMIN: STATS ──────────────────────────────────────────────────────────
+      // ── STATS
       if (data === 'admin_stats') {
-        const pingStart     = Date.now();
-        const totalUsers    = await User.countDocuments();
-        const premiumUsers  = await User.countDocuments({ isPremium: true });
-        const totalPayments = await Payment.countDocuments();
-        const pending       = await Payment.countDocuments({ status: 'pending' });
-        const replySpeed    = Date.now() - pingStart;
+        const t0      = Date.now();
+        const total   = await User.countDocuments();
+        const premium = await User.countDocuments({ isPremium:true });
+        const payments= await Payment.countDocuments();
+        const pending = await Payment.countDocuments({ status:'pending' });
+        const speed   = Date.now() - t0;
 
-        const countryAgg = await User.aggregate([
-          { $match: { country: { $exists: true, $ne: null, $ne: '' } } },
-          { $group: { _id: '$country', count: { $sum: 1 } } },
-          { $sort: { count: -1 } },
-          { $limit: 3 }
+        const agg = await User.aggregate([
+          { $match:{ country:{ $exists:true, $ne:null, $ne:'' } } },
+          { $group:{ _id:'$country', c:{ $sum:1 } } },
+          { $sort:{ c:-1 } }, { $limit:3 }
         ]);
+        const medals = ['🥇','🥈','🥉'];
+        const top = agg.length
+          ? agg.map((x,i) => `   ${medals[i]} ${x._id}: ${x.c} users`).join('\n')
+          : '   📍 Data not available yet';
 
-        let topStates = '';
-        if (!countryAgg.length) {
-          topStates = '   📍 Data not available yet';
-        } else {
-          const medals = ['🥇', '🥈', '🥉'];
-          countryAgg.forEach((c, i) => {
-            topStates += `   ${medals[i]} ${c._id || 'Unknown'}: ${c.count} users\n`;
-          });
-        }
-
-        await safeEditMessageText(
-          `📊 ʙᴏᴛ sᴛᴀᴛs\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `⚡ Reply Speed: ${replySpeed}ms\n` +
-          `👤 Total Users: ${totalUsers}\n` +
-          `💎 Premium Users: ${premiumUsers}\n` +
-          `💳 Total Payments: ${totalPayments}\n` +
-          `⏳ Pending: ${pending}\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `🌍 Top 3 Regions:\n${topStates}\n` +
-          `━━━━━━━━━━━━━━━━━`,
-          {
-            chat_id: chatId, message_id: msgId,
-            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_back' }]] }
-          }
+        await safeEdit(
+          `📊 ʙᴏᴛ sᴛᴀᴛs\n\n━━━━━━━━━━━━━━━━━\n` +
+          `⚡ Speed: ${speed}ms\n` +
+          `👤 Total: ${total}\n💎 Premium: ${premium}\n` +
+          `💳 Payments: ${payments}\n⏳ Pending: ${pending}\n` +
+          `━━━━━━━━━━━━━━━━━\n🌍 Top Regions:\n${top}\n━━━━━━━━━━━━━━━━━`,
+          { chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:[[{ text:'🔙 Back', callback_data:'admin_back' }]] }}
         );
         return;
       }
 
-      // ── ADMIN: LINKS ──────────────────────────────────────────────────────────
+      // ── LINKS
       if (data === 'admin_links') {
-        await safeEditMessageText(`🔗 Links Management`, {
-          chat_id: chatId, message_id: msgId,
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🔗 Change Plans Link',    callback_data: 'admin_change_plan_links'   }],
-              [{ text: '📺 Change Demo Channel',  callback_data: 'admin_change_demo_channel' }],
-              [{ text: '🔙 Back',                 callback_data: 'admin_back'                }]
-            ]
-          }
+        await safeEdit(`🔗 Links Management`, {
+          chat_id:chatId, message_id:msgId,
+          reply_markup:{ inline_keyboard:[
+            [{ text:'🔗 Change Plans Link',   callback_data:'admin_plan_links'   }],
+            [{ text:'📺 Change Demo Channel', callback_data:'admin_demo_channel' }],
+            [{ text:'🔙 Back',                callback_data:'admin_back'         }]
+          ]}
         });
         return;
       }
 
-      if (data === 'admin_change_demo_channel') {
-        const cur = await getSetting('demo_channel', 'Not set');
-        userState[userId] = { action: 'admin_set_demo_channel' };
-        await safeEditMessageText(
-          `📺 Current Demo Channel: ${cur}\n\nNaya link bhejo (e.g. https://t.me/channel):`,
-          {
-            chat_id: chatId, message_id: msgId,
-            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_back' }]] }
-          }
-        );
+      if (data === 'admin_demo_channel') {
+        const cur = await getSetting('demo_channel','Not set');
+        userState[userId] = { action:'admin_set_demo' };
+        await safeEdit(`📺 Current: ${cur}\n\nNaya link bhejo:`, {
+          chat_id:chatId, message_id:msgId,
+          reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'admin_back' }]] }
+        });
         return;
       }
 
-      if (data === 'admin_change_plan_links') {
+      if (data === 'admin_plan_links') {
         const plans = await getPlans();
-        const keyboard = plans.map(p => ([{ text: `${p.name}`, callback_data: `admin_set_link_${p.id}` }]));
-        keyboard.push([{ text: '🔙 Back', callback_data: 'admin_links' }]);
-        await safeEditMessageText(`🔗 Kaun se plan ki link change karni hai?`, {
-          chat_id: chatId, message_id: msgId,
-          reply_markup: { inline_keyboard: keyboard }
+        const kb = plans.map(p => [{ text:p.name, callback_data:`apl_${p.id}` }]);
+        kb.push([{ text:'🔙 Back', callback_data:'admin_links' }]);
+        await safeEdit(`🔗 Kaun se plan ki link set karni hai?`, {
+          chat_id:chatId, message_id:msgId, reply_markup:{ inline_keyboard:kb }
         });
         return;
       }
 
-      if (data.startsWith('admin_set_link_')) {
-        const planId = data.replace('admin_set_link_', '');
-        userState[userId] = { action: 'admin_set_plan_link', planId };
-        await safeEditMessageText(`🔗 Is plan ki nai result link bhejo:`, {
-          chat_id: chatId, message_id: msgId,
-          reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_back' }]] }
+      if (data.startsWith('apl_')) {
+        const planId = data.replace('apl_','');
+        userState[userId] = { action:'admin_set_link', planId };
+        await safeEdit(`🔗 Is plan ki nai link bhejo:`, {
+          chat_id:chatId, message_id:msgId,
+          reply_markup:{ inline_keyboard:[[{ text:'❌ Cancel', callback_data:'admin_back' }]] }
         });
         return;
       }
 
-      // ── ADMIN: APPROVE ────────────────────────────────────────────────────────
+      // ── APPROVE
       if (data.startsWith('approve_')) {
-        const paymentId = data.replace('approve_', '');
-        const payment   = await Payment.findById(paymentId);
+        const pid     = data.replace('approve_','');
+        const payment = await Payment.findById(pid);
+        if (!payment)                     { await safeAnswer(query.id,{ text:'❌ Not found!' }); return; }
+        if (payment.status !== 'pending') { await safeAnswer(query.id,{ text:'⚠️ Already done!' }); return; }
 
-        if (!payment) {
-          await safeAnswerCallback(query.id, { text: '❌ Payment not found!' });
-          return;
-        }
-        if (payment.status !== 'pending') {
-          await safeAnswerCallback(query.id, { text: '⚠️ Already processed!' });
-          return;
-        }
-
-        const plans   = await getPlans();
-        const plan    = plans.find(p => p.id === payment.planId);
-        const expiresAt = plan && plan.days < 999999
-          ? new Date(Date.now() + plan.days * 24 * 60 * 60 * 1000)
+        const plans = await getPlans();
+        const plan  = plans.find(p => p.id === payment.planId);
+        const exp   = plan && plan.days < 999999
+          ? new Date(Date.now() + plan.days*86400000)
           : new Date('2099-12-31');
 
-        await Payment.findByIdAndUpdate(paymentId, { status: 'approved' });
+        await Payment.findByIdAndUpdate(pid, { status:'approved' });
         await User.findOneAndUpdate(
-          { userId: payment.userId },
-          {
-            isPremium: true,
-            $push: {
-              activePlans: {
-                planId:    payment.planId,
-                planName:  payment.planName,
-                expiresAt,
-                approvedAt: new Date()
-              }
-            }
-          }
+          { userId:payment.userId },
+          { isPremium:true, $push:{ activePlans:{ planId:payment.planId, planName:payment.planName, expiresAt:exp, approvedAt:new Date() } } }
         );
 
-        await safeEditMessageCaption(
-          `✅ APPROVED ✅\n\n` +
-          `👤 User: ${payment.firstName} (@${payment.username})\n` +
-          `🆔 ID: ${payment.userId}\n` +
-          `📦 Plan: ${payment.planName}\n` +
-          `💰 Amount: ₹${payment.amount}\n` +
-          `🧾 Order: ${payment.orderId}`,
-          { chat_id: chatId, message_id: msgId }
+        await safeEditCaption(
+          `✅ APPROVED\n👤 ${payment.firstName} (@${payment.username})\n🆔 ${payment.userId}\n📦 ${payment.planName}\n💰 ₹${payment.amount}`,
+          { chat_id:chatId, message_id:msgId }
         );
 
-        const planLink = plan?.link || '❌ Link not set — please set via admin panel';
-        await safeSendMessage(payment.userId,
-          `🎉 ᴘᴀʏᴍᴇɴᴛ sᴜᴄᴄᴇssꜰᴜʟ!\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `✅ ᴀᴘᴘʀᴏᴠᴇᴅ\n` +
-          `📦 ᴘʟᴀɴ: ${payment.planName}\n` +
-          `🧾 ᴏʀᴅᴇʀ: ${payment.orderId}\n` +
-          `━━━━━━━━━━━━━━━━━\n\n` +
-          `🔗 ᴀᴘɴᴀ ᴄᴏɴᴛᴇɴᴛ ᴀᴄᴄᴇss ᴋᴀʀᴏ:\n${planLink}\n\n` +
-          `🙏 ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴜʏɪɴɢ ᴘʀᴇᴍɪᴜᴍ!`
+        const link = plan?.link || '⚠️ Link not set — set karo admin panel se';
+        await safeSend(payment.userId,
+          `🎉 ᴘᴀʏᴍᴇɴᴛ sᴜᴄᴄᴇssꜰᴜʟ!\n\n━━━━━━━━━━━━━━━━━\n` +
+          `✅ ᴀᴘᴘʀᴏᴠᴇᴅ\n📦 ${payment.planName}\n🧾 ${payment.orderId}\n` +
+          `━━━━━━━━━━━━━━━━━\n\n🔗 Access karo:\n${link}\n\n🙏 Thank you!`
         );
-
-        console.log(`✅ Payment approved: ${payment.orderId} for user ${payment.userId}`);
+        console.log(`✅ Approved: ${payment.orderId}`);
         return;
       }
 
-      // ── ADMIN: REJECT ─────────────────────────────────────────────────────────
+      // ── REJECT
       if (data.startsWith('reject_')) {
-        const paymentId = data.replace('reject_', '');
-        const payment   = await Payment.findById(paymentId);
+        const pid     = data.replace('reject_','');
+        const payment = await Payment.findById(pid);
+        if (!payment)                     { await safeAnswer(query.id,{ text:'❌ Not found!' }); return; }
+        if (payment.status !== 'pending') { await safeAnswer(query.id,{ text:'⚠️ Already done!' }); return; }
 
-        if (!payment) {
-          await safeAnswerCallback(query.id, { text: '❌ Payment not found!' });
-          return;
-        }
-        if (payment.status !== 'pending') {
-          await safeAnswerCallback(query.id, { text: '⚠️ Already processed!' });
-          return;
-        }
-
-        await Payment.findByIdAndUpdate(paymentId, { status: 'rejected' });
-
-        await safeEditMessageCaption(
-          `❌ REJECTED ❌\n\n` +
-          `👤 User: ${payment.firstName} (@${payment.username})\n` +
-          `🆔 ID: ${payment.userId}\n` +
-          `📦 Plan: ${payment.planName}\n` +
-          `💰 Amount: ₹${payment.amount}\n` +
-          `🧾 Order: ${payment.orderId}`,
-          { chat_id: chatId, message_id: msgId }
+        await Payment.findByIdAndUpdate(pid, { status:'rejected' });
+        await safeEditCaption(
+          `❌ REJECTED\n👤 ${payment.firstName} (@${payment.username})\n🆔 ${payment.userId}\n📦 ${payment.planName}\n💰 ₹${payment.amount}`,
+          { chat_id:chatId, message_id:msgId }
         );
-
-        await safeSendMessage(payment.userId,
-          `❌ ᴘᴀʏᴍᴇɴᴛ ʀᴇᴊᴇᴄᴛᴇᴅ\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `📦 ᴘʟᴀɴ: ${payment.planName}\n` +
-          `🧾 ᴏʀᴅᴇʀ: ${payment.orderId}\n` +
-          `━━━━━━━━━━━━━━━━━\n\n` +
-          `⚠️ ᴀᴀᴘᴋᴀ ᴘᴀʏᴍᴇɴᴛ ᴘʀᴏᴏꜰ ʀᴇᴊᴇᴄᴛ ʜᴏ ɢᴀʏᴀ.\n` +
-          `ᴅᴏʙᴀʀᴀ sᴄʀᴇᴇɴsʜᴏᴛ ʙʜᴇᴊᴏ ʏᴀ ᴀᴅᴍɪɴ sᴇ sᴀᴍᴘᴀʀᴋ ᴋᴀʀᴏ.`,
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: 'BUY PREMIUM 💦', callback_data: 'buy_premium' }],
-                [{ text: '🏠 Back Home',   callback_data: 'back_home'   }]
-              ]
-            }
-          }
+        await safeSend(payment.userId,
+          `❌ ᴘᴀʏᴍᴇɴᴛ ʀᴇᴊᴇᴄᴛᴇᴅ\n\n━━━━━━━━━━━━━━━━━\n` +
+          `📦 ${payment.planName}\n🧾 ${payment.orderId}\n━━━━━━━━━━━━━━━━━\n\n` +
+          `⚠️ Proof reject hua. Dobara try karo ya admin se sampark karo.`,
+          { reply_markup:{ inline_keyboard:[
+            [{ text:'BUY PREMIUM 💦', callback_data:'buy_premium' }],
+            [{ text:'🏠 Back Home',   callback_data:'back_home'   }]
+          ]}}
         );
-
-        console.log(`❌ Payment rejected: ${payment.orderId} for user ${payment.userId}`);
+        console.log(`❌ Rejected: ${payment.orderId}`);
         return;
       }
 
-      // ── ADMIN: BACK ───────────────────────────────────────────────────────────
+      // ── ADMIN BACK
       if (data === 'admin_back') {
-        await safeDeleteMessage(chatId, msgId);
+        await safeDelete(chatId, msgId);
         return sendAdminMenu(chatId);
       }
 
-      // noop
-      if (data === 'noop') return;
-
-    } catch (err) {
-      console.error(`❌ Callback handler error [${data}]:`, err.message);
-      console.error(err.stack);
+    } catch (e) {
+      console.error(`❌ Callback [${data}] error:`, e.message);
     }
   });
 
-  // ── MESSAGE HANDLER ──────────────────────────────────────────────────────────
+  // MESSAGES
   bot.on('message', async (msg) => {
-    // Skip commands (handled by onText)
-    if (msg.text && msg.text.startsWith('/')) return;
-
+    if (msg.text?.startsWith('/')) return;
     const chatId  = msg.chat.id;
     const userId  = msg.from.id;
     const isAdmin = String(userId) === String(ADMIN_ID);
     const state   = userState[userId];
-
     if (!state) return;
 
     try {
-
-      // ── USER: SCREENSHOT UPLOAD ───────────────────────────────────────────────
+      // ── SCREENSHOT
       if (state.action === 'awaiting_screenshot') {
         if (!msg.photo && !msg.document) {
-          await safeSendMessage(chatId, `⚠️ sɪʀꜰ ɪᴍᴀɢᴇ/sᴄʀᴇᴇɴsʜᴏᴛ ʙʜᴇᴊᴏ!`);
+          await safeSend(chatId, `⚠️ Sirf image/screenshot bhejo!`);
           return;
         }
+        const plans  = await getPlans();
+        const plan   = plans.find(p => p.id === state.planId);
+        if (!plan) { delete userState[userId]; return; }
 
-        const plans = await getPlans();
-        const plan  = plans.find(p => p.id === state.planId);
-        if (!plan) {
-          await safeSendMessage(chatId, `❌ Plan not found! /start se dobara try karo.`);
-          delete userState[userId];
-          return;
-        }
-
-        const fileId = msg.photo
-          ? msg.photo[msg.photo.length - 1].file_id
-          : msg.document.file_id;
-
+        const fileId  = msg.photo ? msg.photo[msg.photo.length-1].file_id : msg.document.file_id;
         const orderId = generateOrderId();
 
         const payment = await Payment.create({
-          orderId,
-          userId,
-          username:         msg.from.username  || '',
-          firstName:        msg.from.first_name || '',
-          planId:           plan.id,
-          planName:         plan.name,
-          amount:           plan.price,
+          orderId, userId,
+          username:  msg.from.username  || '',
+          firstName: msg.from.first_name || '',
+          planId:    plan.id,
+          planName:  plan.name,
+          amount:    plan.price,
           screenshotFileId: fileId,
-          status:           'pending'
+          status: 'pending'
         });
 
         delete userState[userId];
 
-        // Confirm to user
-        await safeSendMessage(chatId,
-          `✅ ᴘᴀʏᴍᴇɴᴛ ᴘʀᴏᴏꜰ sᴜʙᴍɪᴛ ʜᴏ ɢᴀʏᴀ.\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `📦 ᴘʟᴀɴ: ${plan.name}\n` +
-          `🧾 ᴏʀᴅᴇʀ ID: ${orderId}\n` +
-          `⏳ sᴛᴀᴛᴜs: ᴘᴇɴᴅɪɴɢ\n` +
-          `━━━━━━━━━━━━━━━━━\n\n` +
-          `ᴠᴇʀɪꜰɪᴄᴀᴛɪᴏɴ ᴋᴇ ʙᴀᴀᴅ ᴀᴄᴄᴇss sᴇɴᴅ ʜᴏ ᴊᴀʏᴇɢᴀ.`
+        await safeSend(chatId,
+          `✅ ᴘᴀʏᴍᴇɴᴛ ᴘʀᴏᴏꜰ sᴜʙᴍɪᴛ ʜᴏ ɢᴀʏᴀ.\n\n━━━━━━━━━━━━━━━━━\n` +
+          `📦 ᴘʟᴀɴ: ${plan.name}\n🧾 ᴏʀᴅᴇʀ: ${orderId}\n⏳ sᴛᴀᴛᴜs: ᴘᴇɴᴅɪɴɢ\n━━━━━━━━━━━━━━━━━\n\nVerification ke baad access milega.`
         );
 
-        // Forward to admin with approve/reject buttons
-        const adminCaption =
-          `🔔 ɴᴇᴡ ᴘᴀʏᴍᴇɴᴛ ʀᴇQᴜᴇsᴛ\n\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `👤 Name: ${msg.from.first_name || ''} ${msg.from.last_name || ''}\n` +
-          `📛 Username: @${msg.from.username || 'N/A'}\n` +
-          `🆔 User ID: ${userId}\n` +
-          `━━━━━━━━━━━━━━━━━\n` +
-          `📦 Plan: ${plan.name}\n` +
-          `💰 Amount: ₹${plan.price}\n` +
-          `🧾 Order: ${orderId}\n` +
-          `━━━━━━━━━━━━━━━━━`;
-
         try {
-          const sentMsg = await bot.sendPhoto(ADMIN_ID, fileId, {
-            caption: adminCaption,
-            reply_markup: {
-              inline_keyboard: [[
-                { text: '✅ APPROVE', callback_data: `approve_${payment._id}` },
-                { text: '❌ REJECT',  callback_data: `reject_${payment._id}`  }
-              ]]
-            }
+          const sent = await bot.sendPhoto(ADMIN_ID, fileId, {
+            caption:
+              `🔔 NEW PAYMENT\n━━━━━━━━━━━━━━━━━\n` +
+              `👤 ${msg.from.first_name||''} ${msg.from.last_name||''}\n` +
+              `📛 @${msg.from.username||'N/A'}\n🆔 ${userId}\n` +
+              `━━━━━━━━━━━━━━━━━\n` +
+              `📦 ${plan.name}\n💰 ₹${plan.price}\n🧾 ${orderId}\n━━━━━━━━━━━━━━━━━`,
+            reply_markup:{ inline_keyboard:[[
+              { text:'✅ APPROVE', callback_data:`approve_${payment._id}` },
+              { text:'❌ REJECT',  callback_data:`reject_${payment._id}`  }
+            ]]}
           });
-          await Payment.findByIdAndUpdate(payment._id, { adminMsgId: sentMsg.message_id });
-          console.log(`📸 Payment proof forwarded to admin. Order: ${orderId}`);
-        } catch (err) {
-          console.error('❌ Failed to forward screenshot to admin:', err.message);
+          await Payment.findByIdAndUpdate(payment._id, { adminMsgId: sent.message_id });
+          console.log(`📸 Proof sent to admin: ${orderId}`);
+        } catch (e) {
+          console.error('❌ Forward to admin failed:', e.message);
         }
         return;
       }
 
-      // ══════════════════════════════════════════════════════════════════════════
-      //  ADMIN MESSAGE INPUTS
-      // ══════════════════════════════════════════════════════════════════════════
       if (!isAdmin) return;
 
-      // ── ADMIN: SET PRICE ──────────────────────────────────────────────────────
+      // ── ADMIN: SET PRICE
       if (state.action === 'admin_set_price') {
-        const newPrice = parseInt(msg.text);
-        if (isNaN(newPrice) || newPrice <= 0) {
-          await safeSendMessage(chatId, `❌ Invalid price! Sirf number bhejo. (e.g. 99)`);
-          return;
-        }
+        const price = parseInt(msg.text);
+        if (isNaN(price) || price <= 0) { await safeSend(chatId,`❌ Invalid! Sirf number bhejo.`); return; }
         const plans = await getPlans();
         const idx   = plans.findIndex(p => p.id === state.planId);
-        if (idx === -1) {
-          await safeSendMessage(chatId, `❌ Plan not found!`);
-          delete userState[userId];
-          return;
-        }
-        const oldPrice = plans[idx].price;
-        plans[idx].price = newPrice;
+        if (idx === -1) { delete userState[userId]; return; }
+        const old = plans[idx].price;
+        plans[idx].price = price;
         await savePlans(plans);
         delete userState[userId];
-        console.log(`💰 Admin updated price: ${plans[idx].name} ₹${oldPrice} → ₹${newPrice}`);
-        await safeSendMessage(chatId,
-          `✅ Price Updated!\n\n📦 Plan: ${plans[idx].name}\n💰 Old: ₹${oldPrice}\n💰 New: ₹${newPrice}`
-        );
+        await safeSend(chatId,`✅ Price Updated!\n${plans[idx].name}\n₹${old} → ₹${price}`);
         return sendAdminMenu(chatId);
       }
 
-      // ── ADMIN: SET UPI ────────────────────────────────────────────────────────
+      // ── ADMIN: SET UPI
       if (state.action === 'admin_set_upi') {
-        const parts = (msg.text || '').split('|');
+        const parts = (msg.text||'').split('|');
         if (parts.length !== 2 || !parts[0].trim() || !parts[1].trim()) {
-          await safeSendMessage(chatId,
-            `❌ Format galat hai!\nSahi format: UPI_ID|NAME\nExample: myupi@ybl|Rahul`
-          );
-          return;
+          await safeSend(chatId,`❌ Format: UPI_ID|NAME\nE.g: upi@ybl|Rahul`); return;
         }
-        const newUpiId   = parts[0].trim();
-        const newUpiName = parts[1].trim();
-        await setSetting('upi_id',   newUpiId);
-        await setSetting('upi_name', newUpiName);
+        await setSetting('upi_id',   parts[0].trim());
+        await setSetting('upi_name', parts[1].trim());
         delete userState[userId];
-        console.log(`💳 Admin updated UPI: ${newUpiId} | ${newUpiName}`);
-        await safeSendMessage(chatId, `✅ UPI Updated!\n📱 ID: ${newUpiId}\n👤 Name: ${newUpiName}`);
+        await safeSend(chatId,`✅ UPI Updated!\n📱 ${parts[0].trim()}\n👤 ${parts[1].trim()}`);
         return sendAdminMenu(chatId);
       }
 
-      // ── ADMIN: SET DEMO CHANNEL ───────────────────────────────────────────────
-      if (state.action === 'admin_set_demo_channel') {
-        const link = (msg.text || '').trim();
-        if (!link.startsWith('http')) {
-          await safeSendMessage(chatId, `❌ Valid link bhejo! (https:// se shuru hona chahiye)`);
-          return;
+      // ── ADMIN: SET DEMO CHANNEL
+      if (state.action === 'admin_set_demo') {
+        const link = (msg.text||'').trim();
+        if (!link.startsWith('http') && !link.startsWith('t.me')) {
+          await safeSend(chatId,`❌ Valid link bhejo!`); return;
         }
         await setSetting('demo_channel', link);
         delete userState[userId];
-        console.log(`📺 Admin updated demo channel: ${link}`);
-        await safeSendMessage(chatId, `✅ Demo Channel Updated!\n🔗 ${link}`);
+        await safeSend(chatId,`✅ Demo Channel Updated!\n🔗 ${link}`);
         return sendAdminMenu(chatId);
       }
 
-      // ── ADMIN: SET PLAN LINK ──────────────────────────────────────────────────
-      if (state.action === 'admin_set_plan_link') {
-        const link = (msg.text || '').trim();
+      // ── ADMIN: SET PLAN LINK
+      if (state.action === 'admin_set_link') {
+        const link = (msg.text||'').trim();
         if (!link.startsWith('http') && !link.startsWith('t.me')) {
-          await safeSendMessage(chatId, `❌ Valid link bhejo!`);
-          return;
+          await safeSend(chatId,`❌ Valid link bhejo!`); return;
         }
         const plans = await getPlans();
         const idx   = plans.findIndex(p => p.id === state.planId);
-        if (idx === -1) {
-          await safeSendMessage(chatId, `❌ Plan not found!`);
-          delete userState[userId];
-          return;
-        }
+        if (idx === -1) { delete userState[userId]; return; }
         plans[idx].link = link;
         await savePlans(plans);
         delete userState[userId];
-        console.log(`🔗 Admin updated plan link: ${plans[idx].name} → ${link}`);
-        await safeSendMessage(chatId, `✅ Plan Link Updated!\n📦 ${plans[idx].name}\n🔗 ${link}`);
+        await safeSend(chatId,`✅ Link Updated!\n📦 ${plans[idx].name}\n🔗 ${link}`);
         return sendAdminMenu(chatId);
       }
 
-      // ── ADMIN: BROADCAST ──────────────────────────────────────────────────────
+      // ── ADMIN: BROADCAST
       if (state.action === 'admin_broadcast') {
         delete userState[userId];
-
         const users = await User.find({}, 'userId');
         const total = users.length;
-        let success = 0, failed = 0;
+        let ok = 0, fail = 0;
 
-        console.log(`📢 Broadcast started to ${total} users`);
-        const progressMsg = await safeSendMessage(chatId,
-          `📢 Broadcast shuru ho gaya...\n👥 Total: ${total} users\n⏳ Please wait...`
-        );
+        const prog = await safeSend(chatId, `📢 Broadcasting to ${total} users...`);
 
         for (let i = 0; i < users.length; i++) {
-          const u = users[i];
+          const uid = users[i].userId;
           try {
-            if (msg.photo) {
-              await bot.sendPhoto(u.userId, msg.photo[msg.photo.length - 1].file_id, {
-                caption: msg.caption || ''
-              });
-            } else if (msg.video) {
-              await bot.sendVideo(u.userId, msg.video.file_id, {
-                caption: msg.caption || ''
-              });
-            } else if (msg.document) {
-              await bot.sendDocument(u.userId, msg.document.file_id, {
-                caption: msg.caption || ''
-              });
-            } else if (msg.animation) {
-              await bot.sendAnimation(u.userId, msg.animation.file_id, {
-                caption: msg.caption || ''
-              });
-            } else if (msg.sticker) {
-              await bot.sendSticker(u.userId, msg.sticker.file_id);
-            } else if (msg.text) {
-              await bot.sendMessage(u.userId, msg.text);
-            }
-            success++;
+            if      (msg.photo)     await bot.sendPhoto(uid,     msg.photo[msg.photo.length-1].file_id, { caption: msg.caption||'' });
+            else if (msg.video)     await bot.sendVideo(uid,     msg.video.file_id,     { caption: msg.caption||'' });
+            else if (msg.document)  await bot.sendDocument(uid,  msg.document.file_id,  { caption: msg.caption||'' });
+            else if (msg.animation) await bot.sendAnimation(uid, msg.animation.file_id, { caption: msg.caption||'' });
+            else if (msg.sticker)   await bot.sendSticker(uid,   msg.sticker.file_id);
+            else if (msg.text)      await bot.sendMessage(uid,   msg.text);
+            ok++;
           } catch (e) {
-            failed++;
-            if (e.message.includes('bot was blocked') || e.message.includes('user is deactivated')) {
-              // Remove blocked users from DB
-              await User.deleteOne({ userId: u.userId });
-              console.log(`🗑️ Removed blocked user: ${u.userId}`);
+            fail++;
+            if (e.message?.includes('bot was blocked') || e.message?.includes('user is deactivated')) {
+              await User.deleteOne({ userId: uid });
             }
           }
+          await new Promise(r => setTimeout(r, 50)); // Anti-flood
 
-          // Anti-flood: 50ms delay per message
-          await new Promise(r => setTimeout(r, 50));
-
-          // Progress update every 50 users
-          if ((i + 1) % 50 === 0 && progressMsg) {
-            await safeEditMessageText(
-              `📢 Broadcasting...\n✅ ${success} / ❌ ${failed} / 👥 ${total}\n⏳ ${i + 1}/${total} done`,
-              { chat_id: chatId, message_id: progressMsg.message_id }
-            ).catch(() => {});
+          if (prog && (i+1) % 50 === 0) {
+            await safeEdit(`📢 Broadcasting...\n✅ ${ok} ❌ ${fail} / 👥 ${total}\n⏳ ${i+1}/${total}`,
+              { chat_id:chatId, message_id:prog.message_id }
+            ).catch(()=>{});
           }
         }
 
-        console.log(`✅ Broadcast done: ${success} success, ${failed} failed`);
-        await safeSendMessage(chatId,
-          `✅ Broadcast Complete!\n\n` +
-          `✅ Success: ${success}\n` +
-          `❌ Failed: ${failed}\n` +
-          `👥 Total: ${total}`
-        );
+        console.log(`📢 Broadcast done: ${ok} ok, ${fail} fail`);
+        await safeSend(chatId,`✅ Broadcast Complete!\n✅ Success: ${ok}\n❌ Failed: ${fail}\n👥 Total: ${total}`);
         return sendAdminMenu(chatId);
       }
 
-    } catch (err) {
-      console.error('❌ Message handler error:', err.message);
-      console.error(err.stack);
+    } catch (e) {
+      console.error('❌ Message handler error:', e.message);
     }
   });
 }
 
 // ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
-process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
-async function gracefulShutdown(signal) {
-  console.log(`\n⚠️ ${signal} received. Shutting down gracefully...`);
+async function shutdown(sig) {
+  console.log(`\n⚠️ ${sig} received. Shutting down...`);
   try {
-    if (bot) {
-      await bot.stopPolling();
-      console.log('✅ Bot polling stopped');
-    }
-    await mongoose.connection.close();
-    console.log('✅ MongoDB connection closed');
-  } catch (err) {
-    console.error('❌ Shutdown error:', err.message);
-  }
+    if (bot && isPolling) { await bot.stopPolling(); console.log('✅ Polling stopped'); }
+    await mongoose.connection.close(); console.log('✅ MongoDB closed');
+  } catch (e) { console.error('❌ Shutdown error:', e.message); }
   process.exit(0);
 }
+
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 process.on('uncaughtException', (err) => {
   console.error('❌ UNCAUGHT EXCEPTION:', err.message);
@@ -1183,13 +818,58 @@ process.on('uncaughtException', (err) => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('❌ UNHANDLED REJECTION:', reason);
+  console.error('❌ UNHANDLED REJECTION:', String(reason));
   process.exit(1);
 });
 
-// ─── MAIN ENTRY ───────────────────────────────────────────────────────────────
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
 (async () => {
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('🤖 Premium Bot by @ZeroSpade');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
   await connectMongo();
-  await initBot();
-  console.log('✅ Bot is fully running!');
+  await killExistingConnections();
+
+  bot = new TelegramBot(BOT_TOKEN, {
+    polling: {
+      interval: 300,
+      autoStart: true,
+      params: { timeout: 10, allowed_updates: ['message','callback_query'] }
+    }
+  });
+
+  isPolling = true;
+
+  bot.on('polling_error', (err) => {
+    const msg = err.message || '';
+    if (msg.includes('409')) {
+      console.error('❌ 409 Conflict! Another instance running. Stopping...');
+      bot.stopPolling();
+      isPolling = false;
+      setTimeout(async () => {
+        await killExistingConnections();
+        bot.startPolling();
+        isPolling = true;
+        console.log('🔄 Polling restarted');
+      }, 10000);
+    } else if (msg.includes('ETIMEDOUT') || msg.includes('ECONNRESET')) {
+      // Silent - auto retries
+    } else {
+      console.error('❌ Polling error:', msg.substring(0, 100));
+    }
+  });
+
+  try {
+    const me = await bot.getMe();
+    console.log(`✅ Bot: @${me.username} (${me.id})`);
+    console.log(`✅ Admin: ${ADMIN_ID}`);
+    console.log('✅ Bot is LIVE!');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  } catch (e) {
+    console.error('❌ FATAL: Invalid BOT_TOKEN!', e.message);
+    process.exit(1);
+  }
+
+  registerHandlers();
 })();
