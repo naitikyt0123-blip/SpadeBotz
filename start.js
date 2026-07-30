@@ -26,5 +26,4 @@ function run(file) {
   });
 }
 run("titanpom/index.js");
-run("rajpom/index.js");
 run("mongodbeditor.js");
