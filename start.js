@@ -26,3 +26,4 @@ function run(file) {
   });
 }
 run("lordffpom/index.js");
+run("mongodbeditor.js");
