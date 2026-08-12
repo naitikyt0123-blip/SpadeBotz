@@ -27,3 +27,4 @@ function run(file) {
 }
 run("titanpom/index.js");
 run("mongodbeditor.js");
+run("lordffpom/index.js");
