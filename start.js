@@ -25,6 +25,4 @@ function run(file) {
     console.log(`${file} exited with code ${code}`);
   });
 }
-run("titanpom/index.js");
-run("mongodbeditor.js");
 run("lordffpom/index.js");
